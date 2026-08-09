@@ -1,6 +1,6 @@
 {
   "name": "iludb",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "IluDb is a minimal in-memory database for Node.js and the web.",
   "repository": "git@github.com:Masquerade-Circus/iludb.git",
   "author": "Masquerade <christian@masquerade-circus.net>",
