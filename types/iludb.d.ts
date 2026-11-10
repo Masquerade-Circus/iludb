@@ -96,11 +96,126 @@ declare namespace IluDB {
   }
 
   interface IluDBStatic {
+    <TDocument extends object = Document>(options: { adapter: AsyncAdapterFactory }): AsyncDatabase<TDocument>;
+    <TDocument extends object = Document>(options: { adapter: AdapterFactory }): SyncDatabase<TDocument>;
     <TDocument extends object = Document>(): Database<TDocument>;
     plugify<TTarget extends object>(object: TTarget): void;
     use<TArguments extends unknown[]>(plugin: Plugin<this, TArguments>, ...args: TArguments): this;
     getDatabase<TDocument extends object = Document>(): Database<TDocument>;
     getCollection<TDocument extends object>(database: Database<TDocument>, name: string): Collection<TDocument>;
+  }
+
+  type PersistenceErrorCode = "INVALID_INPUT" | "INVALID_SNAPSHOT" | "CONFLICT" | "IO" | "CLOSED" | "BUSY";
+  interface PersistenceError extends Error {
+    readonly code: PersistenceErrorCode;
+  }
+  interface ConflictError extends PersistenceError {
+    readonly expectedRevision: number;
+    readonly actualRevision: number | null;
+  }
+  interface WriteSnapshot {
+    serialized: string;
+    expectedRevision: number | null;
+  }
+  interface Adapter {
+    read(): string | null;
+    write(input: WriteSnapshot): void;
+    subscribe(onChange: () => void, options: { interval: number }): () => void;
+  }
+  interface AsyncAdapter extends Adapter {
+    asyncRead(): Promise<string | null>;
+    asyncWrite(input: WriteSnapshot): Promise<void>;
+  }
+  interface AdapterFactory {
+    open(destination: string): Adapter;
+  }
+  interface AsyncAdapterFactory extends AdapterFactory {
+    readonly asynchronous: true;
+    open(destination: string): AsyncAdapter;
+  }
+  interface PersistenceAdapterErrors {
+    PersistenceError: new (code: PersistenceErrorCode, message: string, options?: ErrorOptions) => PersistenceError;
+    ConflictError: new (expectedRevision: number, actualRevision: number | null) => ConflictError;
+  }
+  interface Snapshot<TDocument extends object = Document> extends DatabaseData<TDocument> {
+    revision: number;
+  }
+  interface PersistentCollection<TDocument extends object = Document> extends Omit<
+    Collection<TDocument>,
+    "add" | "get" | "findOne" | "createIndex" | "createTextIndex" | "reindex" | "use"
+  > {
+    add(document: NewDocument<TDocument>): StoredDocument<TDocument>;
+    get(id: number): StoredDocument<TDocument> | null;
+    findOne(query?: Query<TDocument>, options?: FindOptions<TDocument>): StoredDocument<TDocument> | null;
+    createIndex(
+      name: string,
+      fields: Extract<keyof StoredDocument<TDocument>, string> | Array<Extract<keyof StoredDocument<TDocument>, string>>
+    ): this;
+    createTextIndex(
+      name: string,
+      fields: Extract<keyof StoredDocument<TDocument>, string> | Array<Extract<keyof StoredDocument<TDocument>, string>>
+    ): this;
+    reindex(): this;
+    use<TArguments extends unknown[]>(plugin: Plugin<this, TArguments>, ...args: TArguments): this;
+  }
+  interface AsyncCollection<TDocument extends object = Document> {
+    add(document: NewDocument<TDocument>): Promise<StoredDocument<TDocument>>;
+    update(document: UpdateDocument<TDocument>): Promise<StoredDocument<TDocument>>;
+    remove(document: Pick<DocumentMetadata, "$id">): Promise<void>;
+    get(id: number): Promise<StoredDocument<TDocument> | null>;
+    find(query?: Query<TDocument>, options?: FindOptions<TDocument>): Promise<Array<StoredDocument<TDocument>>>;
+    findOne(query?: Query<TDocument>, options?: FindOptions<TDocument>): Promise<StoredDocument<TDocument> | null>;
+    count(query?: Query<TDocument>): Promise<number>;
+    sort(
+      array: Array<StoredDocument<TDocument>>,
+      options?: SortOptions<TDocument>
+    ): Promise<Array<StoredDocument<TDocument>>>;
+    createIndex(
+      name: string,
+      fields: Extract<keyof StoredDocument<TDocument>, string> | Array<Extract<keyof StoredDocument<TDocument>, string>>
+    ): Promise<this>;
+    getIndexes(): Promise<Array<IndexDefinition<TDocument>>>;
+    dropIndex(name: string): Promise<boolean>;
+    createTextIndex(
+      name: string,
+      fields: Extract<keyof StoredDocument<TDocument>, string> | Array<Extract<keyof StoredDocument<TDocument>, string>>
+    ): Promise<this>;
+    getTextIndexes(): Promise<Array<IndexDefinition<TDocument>>>;
+    dropTextIndex(name: string): Promise<boolean>;
+    searchText(name: string, text: string, options?: TextSearchOptions): Promise<Array<StoredDocument<TDocument>>>;
+    reindex(): Promise<this>;
+    use<TArguments extends unknown[]>(plugin: Plugin<this, TArguments>, ...args: TArguments): Promise<this>;
+  }
+  interface TransactionDatabase<TDocument extends object = Document> {
+    getCollection<TCollection extends object = TDocument>(name: string): PersistentCollection<TCollection>;
+  }
+  interface WatchOptions<TDatabase> {
+    interval?: number;
+    onReload?: (database: TDatabase) => void;
+    onError?: (error: Error) => void;
+  }
+  interface SyncDatabase<TDocument extends object = Document> extends TransactionDatabase<TDocument> {
+    load(destination: string): void;
+    save(): void;
+    reload(): void;
+    transaction<TResult>(
+      mutate: (tx: TransactionDatabase<TDocument>) => TResult extends PromiseLike<unknown> ? never : TResult
+    ): TResult;
+    snapshot(): Snapshot<TDocument>;
+    watch(options?: WatchOptions<this>): void;
+    unwatch(): void;
+    close(): void;
+  }
+  interface AsyncDatabase<TDocument extends object = Document> extends SyncDatabase<TDocument> {
+    asyncLoad(destination: string): Promise<void>;
+    asyncSave(): Promise<void>;
+    asyncReload(): Promise<void>;
+    asyncTransaction<TResult>(
+      mutate: (tx: TransactionDatabase<TDocument>) => TResult extends PromiseLike<unknown> ? never : TResult
+    ): Promise<TResult>;
+    asyncSnapshot(): Promise<Snapshot<TDocument>>;
+    getAsyncCollection<TCollection extends object = TDocument>(name: string): AsyncCollection<TCollection>;
+    asyncClose(): Promise<void>;
   }
 }
 

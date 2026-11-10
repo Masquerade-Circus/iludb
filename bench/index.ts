@@ -600,13 +600,14 @@ const persistenceFixtures = [100, 1_000].map((size) => {
     size
   };
 });
-JSONIluDb.use(nodeJSONPlugin);
 for (let index = 0; index < persistenceFixtures.length; index += 1) {
   const fixture = persistenceFixtures[index];
   await Bun.write(fixture.file, fixture.serialized);
-  const jsonDatabase = JSONIluDb(fixture.file) as Database & {
+  const jsonDatabase = JSONIluDb({ adapter: nodeJSONPlugin }) as Database & {
+    load(destination: string): void;
     reload(): void;
   };
+  jsonDatabase.load(fixture.file);
   const records = jsonDatabase.getCollection("records");
   records.createIndex("by-group", "group");
   records.createTextIndex("content", "body");

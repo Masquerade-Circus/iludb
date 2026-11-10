@@ -1,3 +1,5 @@
+import { createPersistentDatabase } from "./persistence";
+
 type Document = Record<string, any>;
 type Query = Record<string, any>;
 type SortOptions = Record<string, 1 | -1>;
@@ -435,6 +437,22 @@ function sortDocuments(array: Document[], options: SortOptions): Document[] {
 }
 
 const IluDB = function (...args: any[]): Database {
+  if (args.length > 0) {
+    const options = args[0];
+    if (
+      args.length !== 1 ||
+      options === null ||
+      typeof options !== "object" ||
+      typeof options.adapter?.open !== "function"
+    ) {
+      throw new TypeError("Create IluDB without a path and load a storage destination explicitly.");
+    }
+    return createPersistentDatabase({
+      core: IluDB,
+      factory: options.adapter,
+      asynchronous: options.adapter.asynchronous === true
+    });
+  }
   return IluDB.getDatabase(...args);
 } as IluDBStatic;
 
@@ -454,7 +472,10 @@ IluDB.plugify = function (object: any): void {
 
 IluDB.plugify(IluDB);
 
-IluDB.getDatabase = function (): Database {
+IluDB.getDatabase = function (...args: any[]): Database {
+  if (args.length > 0) {
+    throw new TypeError("Use IluDB({ adapter }) and load a storage destination explicitly.");
+  }
   const database = {
     data: {
       collections: {},

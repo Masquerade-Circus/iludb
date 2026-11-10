@@ -19,9 +19,17 @@
   "jsdelivr": "./dist/iludb.min.js",
   "minified:main": "dist/iludb.min.js",
   "exports": {
+    "./plugins/local-storage": {
+      "types": "./dist/plugins/local-storage.d.ts",
+      "default": "./dist/plugins/local-storage.js"
+    },
     ".": {
       "types": "./dist/iludb.d.ts",
       "default": "./dist/iludb.js"
+    },
+    "./plugins/bun-json": {
+      "types": "./dist/plugins/bun-json.d.ts",
+      "default": "./dist/plugins/bun-json.js"
     },
     "./plugins/node-json": {
       "types": "./dist/plugins/node-json.d.ts",
@@ -36,10 +44,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "bun run build && bun test ./test/index.ts ./test/entrypoints.test.ts",
+    "test:browser": "bun run build && playwright test",
     "bench": "bun run build && bun run bench/index.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.65.0",
     "@types/bun": "^1.2.20",
     "eslint": "^10.8.1",
     "globals": "^17.9.0",

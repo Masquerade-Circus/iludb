@@ -1,0 +1,367 @@
+(function (root, factory) {
+    if (typeof module === "object" && module && module.exports) {
+        module.exports = factory(require);
+        return;
+    }
+    if (typeof define === "function" && define.amd) {
+        define(["node:fs", "node:fs/promises", "node:path", "node:crypto"], function (dependency0, dependency1, dependency2, dependency3) {
+            return factory(function (id) {
+            if (id === "node:fs") { return dependency0; }
+            if (id === "node:fs/promises") { return dependency1; }
+            if (id === "node:path") { return dependency2; }
+            if (id === "node:crypto") { return dependency3; }
+                throw new Error("Unsupported external module: " + id);
+            });
+        });
+        return;
+    }
+    root.IluDBBunJSONPlugin = factory(
+        typeof root.require === "function" ? root.require : null,
+    );
+})(typeof globalThis === "object" ? globalThis : this, function (externalRequire) {
+    const module = { exports: {} };
+    const exports = module.exports;
+    const require = externalRequire ?? function (id) {
+        throw new Error("External module is unavailable in this runtime: " + id);
+    };
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+function __accessProp(key) {
+  return this[key];
+}
+var __toCommonJS = (from) => {
+  var entry = (__moduleCache ??= new WeakMap).get(from), desc;
+  if (entry)
+    return entry;
+  entry = __defProp({}, "__esModule", { value: true });
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (var key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(entry, key))
+        __defProp(entry, key, {
+          get: __accessProp.bind(from, key),
+          enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable
+        });
+  }
+  __moduleCache.set(from, entry);
+  return entry;
+};
+var __moduleCache;
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, {
+      get: all[name],
+      enumerable: true,
+      configurable: true,
+      set: __exportSetter.bind(all, name)
+    });
+};
+
+// src/plugins/bun-json.ts
+var exports_bun_json = {};
+__export(exports_bun_json, {
+  default: () => bun_json_default
+});
+module.exports = __toCommonJS(exports_bun_json);
+
+// src/plugins/file-storage.ts
+var import_node_fs = require("node:fs");
+var import_promises = require("node:fs/promises");
+var import_node_path = require("node:path");
+var import_node_crypto = require("node:crypto");
+
+// src/persistence.ts
+class PersistenceError extends Error {
+  code;
+  constructor(code, message, options) {
+    super(message, options);
+    this.code = code;
+    this.name = "PersistenceError";
+  }
+}
+
+class ConflictError extends PersistenceError {
+  expectedRevision;
+  actualRevision;
+  constructor(expectedRevision, actualRevision) {
+    super("CONFLICT", "The persisted snapshot revision changed.");
+    this.expectedRevision = expectedRevision;
+    this.actualRevision = actualRevision;
+  }
+}
+function plain(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+}
+function restore(serialized) {
+  try {
+    const data = JSON.parse(serialized);
+    if (!plain(data) || !plain(data.collections)) {
+      throw new Error("Invalid database");
+    }
+    if (!Object.hasOwn(data, "revision")) {
+      data.revision = 0;
+    }
+    if (!Number.isSafeInteger(data.revision) || data.revision < 0) {
+      throw new Error("Invalid revision");
+    }
+    const timestamp = (owner, key) => {
+      const value = owner[key];
+      if (typeof value !== "string") {
+        throw new Error("Invalid timestamp");
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime()) || date.toISOString() !== value) {
+        throw new Error("Invalid timestamp");
+      }
+      owner[key] = date;
+    };
+    timestamp(data, "createdAt");
+    timestamp(data, "modifiedAt");
+    for (const [name, collection] of Object.entries(data.collections)) {
+      assertCollectionName(name);
+      if (!plain(collection) || !Array.isArray(collection.data) || !Number.isSafeInteger(collection.index) || collection.index < 0) {
+        throw new Error("Invalid collection");
+      }
+      timestamp(collection, "createdAt");
+      timestamp(collection, "modifiedAt");
+      const ids = new Set;
+      for (const document of collection.data) {
+        if (!plain(document) || !Number.isSafeInteger(document.$id) || document.$id <= 0 || document.$id > collection.index || ids.has(document.$id)) {
+          throw new Error("Invalid document");
+        }
+        ids.add(document.$id);
+        timestamp(document, "$createdAt");
+        timestamp(document, "$modifiedAt");
+      }
+    }
+    return data;
+  } catch (cause) {
+    throw new PersistenceError("INVALID_SNAPSHOT", "Invalid IluDB snapshot.", { cause });
+  }
+}
+function checkRevision(input) {
+  const actual = typeof input.serialized === "string" ? restore(input.serialized).revision : null;
+  if (actual !== input.expectedRevision) {
+    throw new ConflictError(input.expectedRevision ?? 0, actual);
+  }
+}
+function assertCollectionName(name) {
+  if (typeof name !== "string" || name.trim().length === 0 || name.trim() !== name || ["__proto__", "constructor", "prototype"].includes(name)) {
+    throw new PersistenceError("INVALID_INPUT", "Invalid collection name.");
+  }
+}
+
+// src/plugins/file-storage.ts
+function signature(stats) {
+  return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
+}
+function io(cause) {
+  throw cause instanceof PersistenceError ? cause : new PersistenceError("IO", "Snapshot filesystem operation failed.", { cause });
+}
+function fileAdapter(native = null) {
+  return {
+    asynchronous: true,
+    open(destination) {
+      const file = import_node_path.resolve(destination);
+      function read() {
+        let descriptor;
+        try {
+          descriptor = import_node_fs.openSync(file, import_node_fs.constants.O_RDONLY | import_node_fs.constants.O_NOFOLLOW);
+        } catch (cause) {
+          if (cause.code === "ENOENT") {
+            return null;
+          }
+          return io(cause);
+        }
+        try {
+          const before = import_node_fs.fstatSync(descriptor);
+          if (!before.isFile()) {
+            throw new Error("Expected regular file");
+          }
+          const serialized = import_node_fs.readFileSync(descriptor, "utf8");
+          const after = import_node_fs.fstatSync(descriptor);
+          const current = import_node_fs.lstatSync(file);
+          if (!current.isFile() || signature(before) !== signature(after) || signature(after) !== signature(current)) {
+            throw new Error("Snapshot changed during reading");
+          }
+          return serialized;
+        } catch (cause) {
+          return io(cause);
+        } finally {
+          import_node_fs.closeSync(descriptor);
+        }
+      }
+      async function asyncRead() {
+        let descriptor;
+        try {
+          descriptor = await import_promises.open(file, import_node_fs.constants.O_RDONLY | import_node_fs.constants.O_NOFOLLOW);
+        } catch (cause) {
+          if (cause.code === "ENOENT") {
+            return null;
+          }
+          return io(cause);
+        }
+        try {
+          const before = await descriptor.stat();
+          if (!before.isFile()) {
+            throw new Error("Expected regular file");
+          }
+          const serialized = native === null ? await descriptor.readFile("utf8") : await native.file(descriptor.fd).text();
+          const after = await descriptor.stat();
+          const current = await import_promises.lstat(file);
+          if (!current.isFile() || signature(before) !== signature(after) || signature(after) !== signature(current)) {
+            throw new Error("Snapshot changed during reading");
+          }
+          return serialized;
+        } catch (cause) {
+          return io(cause);
+        } finally {
+          await descriptor.close();
+        }
+      }
+      return {
+        read,
+        asyncRead,
+        write(input) {
+          const temporary = `${file}.tmp-${import_node_crypto.randomUUID()}`;
+          let descriptor = null;
+          let created = false;
+          let published = false;
+          let failure = null;
+          try {
+            checkRevision({ serialized: read(), expectedRevision: input.expectedRevision });
+            const mode = input.expectedRevision === null ? 384 : import_node_fs.lstatSync(file).mode & 4095;
+            if (input.expectedRevision === null) {
+              import_node_fs.mkdirSync(import_node_path.dirname(file), { recursive: true, mode: 448 });
+            }
+            descriptor = import_node_fs.openSync(temporary, "wx", 384);
+            created = true;
+            const bytes = Buffer.from(input.serialized);
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = import_node_fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
+              if (count <= 0) {
+                throw new Error("Incomplete write");
+              }
+              offset += count;
+            }
+            import_node_fs.fchmodSync(descriptor, mode);
+            import_node_fs.fsyncSync(descriptor);
+            import_node_fs.closeSync(descriptor);
+            descriptor = null;
+            if (input.expectedRevision === null) {
+              import_node_fs.linkSync(temporary, file);
+            } else {
+              import_node_fs.renameSync(temporary, file);
+            }
+            published = true;
+          } catch (cause) {
+            failure = cause;
+          } finally {
+            if (descriptor !== null) {
+              try {
+                import_node_fs.closeSync(descriptor);
+              } catch (cause) {
+                failure = failure === null ? cause : new AggregateError([failure, cause]);
+              }
+            }
+            if (created && (!published || input.expectedRevision === null)) {
+              try {
+                import_node_fs.unlinkSync(temporary);
+              } catch (cause) {
+                if (!published) {
+                  failure = failure === null ? cause : new AggregateError([failure, cause]);
+                } else {
+                  process.emitWarning("Committed snapshot temporary cleanup failed.");
+                }
+              }
+            }
+          }
+          if (failure !== null) {
+            io(failure);
+          }
+        },
+        async asyncWrite(input) {
+          const temporary = `${file}.tmp-${import_node_crypto.randomUUID()}`;
+          let descriptor = null;
+          let created = false;
+          let published = false;
+          let failure = null;
+          try {
+            checkRevision({ serialized: await asyncRead(), expectedRevision: input.expectedRevision });
+            const mode = input.expectedRevision === null ? 384 : (await import_promises.lstat(file)).mode & 4095;
+            if (input.expectedRevision === null) {
+              await import_promises.mkdir(import_node_path.dirname(file), { recursive: true, mode: 448 });
+            }
+            descriptor = await import_promises.open(temporary, "wx", 384);
+            created = true;
+            const bytes = Buffer.from(input.serialized);
+            if (native === null) {
+              await descriptor.writeFile(bytes);
+            } else if (await native.write(native.file(descriptor.fd), bytes) !== bytes.length) {
+              throw new Error("Incomplete write");
+            }
+            await descriptor.chmod(mode);
+            await descriptor.sync();
+            await descriptor.close();
+            descriptor = null;
+            if (input.expectedRevision === null) {
+              await import_promises.link(temporary, file);
+            } else {
+              await import_promises.rename(temporary, file);
+            }
+            published = true;
+          } catch (cause) {
+            failure = cause;
+          } finally {
+            if (descriptor !== null) {
+              try {
+                await descriptor.close();
+              } catch (cause) {
+                failure = failure === null ? cause : new AggregateError([failure, cause]);
+              }
+            }
+            if (created && (!published || input.expectedRevision === null)) {
+              try {
+                if (native === null) {
+                  await import_promises.unlink(temporary);
+                } else {
+                  await native.file(temporary).delete();
+                }
+              } catch (cause) {
+                if (!published) {
+                  failure = failure === null ? cause : new AggregateError([failure, cause]);
+                } else {
+                  process.emitWarning("Committed snapshot temporary cleanup failed.");
+                }
+              }
+            }
+          }
+          if (failure !== null) {
+            io(failure);
+          }
+        },
+        subscribe(onChange, options) {
+          const listener = () => onChange();
+          import_node_fs.watchFile(file, { interval: options.interval, persistent: false }, listener);
+          return () => import_node_fs.unwatchFile(file, listener);
+        }
+      };
+    }
+  };
+}
+
+// src/plugins/bun-json.ts
+var bunJSON = Object.assign(fileAdapter(Bun), { ConflictError, PersistenceError });
+var bun_json_default = bunJSON;
+
+    const value = module.exports;
+    return value && value.__esModule && "default" in value
+        ? value.default
+        : value;
+});

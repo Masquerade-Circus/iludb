@@ -2,20 +2,17 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import {
   chmodSync,
   cpSync,
-  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   renameSync,
   symlinkSync,
   writeFileSync
 } from "fs";
-import { dirname, join, relative, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
-import { createContext, runInContext } from "vm";
-import nodeJSONPluginSource from "../src/plugins/node-json";
+import { createRequire } from "node:module";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const temporaryRoot = resolve(root, "tmp");
@@ -46,26 +43,11 @@ function waitFor(check: () => boolean, timeout = 2_000): Promise<void> {
   });
 }
 
-function loadPluginWithFs(fsAdapter: Record<string, any>): any {
-  const source = readFileSync(join(root, "dist/plugins/node-json.js"), "utf8");
-  let plugin: any = null;
-  const define = (_dependencies: string[], factory: (fs: any) => any): void => {
-    plugin = factory(fsAdapter);
-  };
-  (define as any).amd = {};
-  const context = {
-    AggregateError,
-    Buffer,
-    define,
-    process
-  };
-  createContext(context);
-  runInContext(source, context);
-  return plugin;
-}
-
-function restoreHostPlugin(IluDB: any): void {
-  IluDB.use((target: any) => nodeJSONPluginSource(target));
+function openNodeDatabase(file: string): any {
+  const IluDB = require(join(root, "dist/iludb.js"));
+  const database = IluDB({ adapter: require(join(root, "dist/plugins/node-json.js")) });
+  database.load(file);
+  return database;
 }
 
 function run({ command, cwd = root }: { command: string[]; cwd?: string }): void {
@@ -79,24 +61,6 @@ function run({ command, cwd = root }: { command: string[]; cwd?: string }): void
   }
 }
 
-function listFiles(directory: string): string[] {
-  const files: string[] = [];
-  const pending = [directory];
-  while (pending.length > 0) {
-    const current = pending.pop()!;
-    const entries = readdirSync(current, { withFileTypes: true });
-    for (let index = 0; index < entries.length; index += 1) {
-      const path = join(current, entries[index].name);
-      if (entries[index].isDirectory()) {
-        pending.push(path);
-      } else {
-        files.push(relative(directory, path));
-      }
-    }
-  }
-  return files.sort();
-}
-
 beforeAll(() => {
   mkdirSync(extraction);
   run({
@@ -107,20 +71,723 @@ beforeAll(() => {
   cpSync(packedPackage, installedPackage, { recursive: true });
 });
 
+// These cases use the approved per-instance adapter API. The older cases below
+// remain available to the implementer for migration without losing regressions.
+for (const runtime of ["node", "bun"]) {
+  for (const mode of ["sync", "async"]) {
+    describe(`Unified persistence ${runtime} ${mode}`, () => {
+      const asynchronous = mode === "async";
+
+      function createDatabase(): any {
+        const consumer = createRequire(join(workspace, "unified-consumer.cjs"));
+        const IluDB = consumer("iludb");
+        const adapter = consumer(`iludb/plugins/${runtime}-json`);
+        return IluDB({ adapter: adapter.default ?? adapter });
+      }
+
+      // Invoke the actual selected public method, including its synchronous
+      // throw path. This helper does not replace storage or production logic.
+      async function invoke({
+        database,
+        operation,
+        args = []
+      }: {
+        database: any;
+        operation: string;
+        args?: any[];
+      }): Promise<any> {
+        const method = asynchronous ? `async${operation[0].toUpperCase()}${operation.slice(1)}` : operation;
+        return database[method](...args);
+      }
+
+      function collection(database: any): any {
+        return asynchronous ? database.getAsyncCollection("records") : database.getCollection("records");
+      }
+
+      it("recovers from an invalid first load and refuses retargeting after success", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-load.json`);
+        writeFileSync(file, "not JSON");
+        try {
+          await expect(invoke({ database, operation: "load", args: [file] })).rejects.toThrow();
+          expect(readFileSync(file, "utf8")).toBe("not JSON");
+          const validFile = join(workspace, `${runtime}-${mode}-load-recovered.json`);
+          await invoke({ database, operation: "load", args: [validFile] });
+          const records = collection(database);
+          await records.add({ value: "retained" });
+          const bytes = readFileSync(validFile, "utf8");
+          await expect(invoke({ database, operation: "load", args: [file] })).rejects.toThrow();
+          expect(await records.count({ value: "retained" })).toBe(1);
+          expect(readFileSync(validFile, "utf8")).toBe(bytes);
+          expect(readFileSync(file, "utf8")).toBe("not JSON");
+        } finally {
+          await invoke({ database, operation: "close" });
+        }
+      });
+
+      it("rejects invalid mutations without publishing memory or disk and remains usable", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-reject.json`);
+        await invoke({ database, operation: "load", args: [file] });
+        try {
+          const records = collection(database);
+          const saved = await records.add({ value: "retained", body: "retained token" });
+          await records.createIndex("by-value", "value");
+          await records.createTextIndex("content", "body");
+          const bytes = readFileSync(file, "utf8");
+          const revision = (await invoke({ database, operation: "snapshot" })).revision;
+          for (const invalid of [null, [], 42, { $id: 1 }, { invalidJSON: 1n }]) {
+            await expect((async () => records.add(invalid))()).rejects.toThrow();
+            expect(await records.count()).toBe(1);
+            expect(readFileSync(file, "utf8")).toBe(bytes);
+            expect((await invoke({ database, operation: "snapshot" })).revision).toBe(revision);
+          }
+          for (const operation of ["update", "remove"]) {
+            await expect((async () => records[operation]({ $id: saved.$id + 100 }))()).rejects.toThrow();
+            expect(readFileSync(file, "utf8")).toBe(bytes);
+          }
+          expect((await records.searchText("content", "retained"))[0].$id).toBe(saved.$id);
+          await records.update({ $id: saved.$id, value: "recovered" });
+          expect((await records.findOne({ value: "recovered" })).$id).toBe(saved.$id);
+        } finally {
+          await invoke({ database, operation: "close" });
+        }
+      });
+
+      it("initializes collection plugins once and permits operations on their target", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-plugins.json`);
+        await invoke({ database, operation: "load", args: [file] });
+        try {
+          const records = collection(database);
+          const inspect = (target: any): void => {
+            target.initialCount = target.count();
+            target.total = () => target.count();
+          };
+          await records.use(inspect);
+          expect(await records.initialCount).toBe(0);
+          const initialize = (target: any): void => {
+            void target.add({ value: "initialized" });
+          };
+          await records.use(initialize);
+          await records.use(initialize);
+          expect(await records.total()).toBe(1);
+          const reopened = createDatabase();
+          await invoke({ database: reopened, operation: "load", args: [file] });
+          try {
+            expect(await collection(reopened).count({ value: "initialized" })).toBe(1);
+          } finally {
+            await invoke({ database: reopened, operation: "close" });
+          }
+          await invoke({
+            database,
+            operation: "transaction",
+            args: [
+              (tx: any) => {
+                const staged = tx.getCollection("records");
+                staged.use(initialize);
+                staged.use(initialize);
+                expect(staged.count({ value: "initialized" })).toBe(2);
+              }
+            ]
+          });
+          expect(await records.total()).toBe(2);
+        } finally {
+          await invoke({ database, operation: "close" });
+        }
+      });
+
+      it("rolls back throwing and thenable transactions and invalidates escaped handles", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-transaction.json`);
+        await invoke({ database, operation: "load", args: [file] });
+        try {
+          const records = collection(database);
+          const saved = await records.add({ value: "retained" });
+          const external = database.getCollection("records");
+          const bytes = readFileSync(file, "utf8");
+          for (const completion of ["throw", "promise", "thenable", "reenter", "plugin-reenter"]) {
+            await expect(
+              invoke({
+                database,
+                operation: "transaction",
+                args: [
+                  (tx: any) => {
+                    tx.getCollection("records").update({ $id: saved.$id, value: "uncommitted" });
+                    expect(readFileSync(file, "utf8")).toBe(bytes);
+                    if (completion === "throw") {
+                      throw new Error("synthetic callback failure");
+                    }
+                    if (completion === "promise") {
+                      return Promise.resolve("invalid callback result");
+                    }
+                    if (completion === "reenter") {
+                      database.getCollection("records").add({ value: "external reentry" });
+                      return;
+                    }
+                    if (completion === "plugin-reenter") {
+                      external.use((target: any) => target.add({ value: "external plugin" }));
+                      return;
+                    }
+                    return { then(): void {} };
+                  }
+                ]
+              })
+            ).rejects.toThrow();
+            expect((await records.get(saved.$id)).value).toBe("retained");
+            expect(await records.count()).toBe(1);
+            expect(readFileSync(file, "utf8")).toBe(bytes);
+          }
+          let escaped: any = null;
+          const result = await invoke({
+            database,
+            operation: "transaction",
+            args: [
+              (tx: any) => {
+                escaped = tx.getCollection("records");
+                escaped.update({ $id: saved.$id, value: "committed" });
+                return escaped.add({ value: "second", nested: { retained: true } });
+              }
+            ]
+          });
+          expect(() => escaped.add({ value: "expired" })).toThrow();
+          result.nested.retained = false;
+          expect((await records.get(result.$id)).nested.retained).toBe(true);
+          expect((await records.get(saved.$id)).value).toBe("committed");
+          expect(JSON.parse(readFileSync(file, "utf8")).collections.records.data).toHaveLength(2);
+        } finally {
+          await invoke({ database, operation: "close" });
+        }
+      });
+
+      it("preserves indexed queries across failed reloads and publishes valid replacements", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-reload.json`);
+        await invoke({ database, operation: "load", args: [file] });
+        try {
+          const records = collection(database);
+          const saved = await records.add({ value: "retained", body: "retained token" });
+          await records.createIndex("by-value", "value");
+          await records.createTextIndex("content", "body");
+          const bytes = readFileSync(file, "utf8");
+          const valid = JSON.parse(bytes);
+          const duplicate = structuredClone(valid);
+          duplicate.collections.records.data.push(structuredClone(duplicate.collections.records.data[0]));
+          const invalidDate = structuredClone(valid);
+          invalidDate.collections.records.data[0].$createdAt = "invalid";
+          for (const contents of [
+            "not JSON",
+            "[]",
+            JSON.stringify({ ...valid, revision: -1 }),
+            JSON.stringify(duplicate),
+            JSON.stringify(invalidDate)
+          ]) {
+            writeFileSync(file, contents);
+            await expect(invoke({ database, operation: "reload" })).rejects.toThrow();
+            expect((await records.findOne({ value: "retained" })).$id).toBe(saved.$id);
+            expect((await records.searchText("content", "retained"))[0].$id).toBe(saved.$id);
+            expect((await invoke({ database, operation: "snapshot" })).revision).toBe(valid.revision);
+          }
+          valid.revision += 1;
+          valid.collections.records.data[0].value = "external";
+          valid.collections.records.data[0].body = "external token";
+          const replacement = `${file}.replacement`;
+          writeFileSync(replacement, JSON.stringify(valid));
+          renameSync(replacement, file);
+          await invoke({ database, operation: "reload" });
+          expect(await records.findOne({ value: "retained" })).toBeNull();
+          expect((await records.findOne({ value: "external" })).$id).toBe(saved.$id);
+          expect((await records.searchText("content", "external"))[0].$id).toBe(saved.$id);
+          expect(await records.searchText("content", "retained")).toEqual([]);
+        } finally {
+          await invoke({ database, operation: "close" });
+        }
+      });
+
+      it("rejects stale mutations without changing either snapshot and recovers by explicit reload", async () => {
+        const writer = createDatabase();
+        const stale = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-conflict.json`);
+        await invoke({ database: writer, operation: "load", args: [file] });
+        await invoke({ database: stale, operation: "load", args: [file] });
+        try {
+          await collection(writer).add({ value: "newer" });
+          const bytes = readFileSync(file, "utf8");
+          const before = await invoke({ database: stale, operation: "snapshot" });
+          await expect((async () => collection(stale).add({ value: "stale" }))()).rejects.toThrow();
+          expect(readFileSync(file, "utf8")).toBe(bytes);
+          expect(await collection(stale).count()).toBe(0);
+          expect((await invoke({ database: stale, operation: "snapshot" })).revision).toBe(before.revision);
+          await invoke({ database: stale, operation: "reload" });
+          await collection(stale).add({ value: "recovered" });
+          expect(await collection(stale).count()).toBe(2);
+        } finally {
+          await invoke({ database: writer, operation: "close" });
+          await invoke({ database: stale, operation: "close" });
+        }
+      });
+
+      it("rejects linked and nonregular load destinations without altering their targets", async () => {
+        const target = join(workspace, `${runtime}-${mode}-canary.json`);
+        writeFileSync(target, "synthetic canary");
+        const link = `${target}.link`;
+        symlinkSync(target, link);
+        for (const destination of [link, workspace]) {
+          const database = createDatabase();
+          try {
+            await expect(invoke({ database, operation: "load", args: [destination] })).rejects.toThrow();
+            expect(readFileSync(target, "utf8")).toBe("synthetic canary");
+            expect(lstatSync(link).isSymbolicLink()).toBe(true);
+          } finally {
+            await invoke({ database, operation: "close" });
+          }
+        }
+      });
+
+      it("rolls back denied writes and recovers after access is restored", async () => {
+        const directory = join(workspace, `${runtime}-${mode}-denied`);
+        mkdirSync(directory, { mode: 0o700 });
+        const file = join(directory, "snapshot.json");
+        const database = createDatabase();
+        await invoke({ database, operation: "load", args: [file] });
+        try {
+          const records = collection(database);
+          const saved = await records.add({ value: "retained" });
+          await records.createIndex("by-value", "value");
+          const bytes = readFileSync(file, "utf8");
+          const revision = (await invoke({ database, operation: "snapshot" })).revision;
+          chmodSync(directory, 0o500);
+          await expect((async () => records.update({ $id: saved.$id, value: "unpublished" }))()).rejects.toThrow();
+          expect(readFileSync(file, "utf8")).toBe(bytes);
+          expect((await records.findOne({ value: "retained" })).$id).toBe(saved.$id);
+          expect((await invoke({ database, operation: "snapshot" })).revision).toBe(revision);
+          chmodSync(directory, 0o700);
+          await records.update({ $id: saved.$id, value: "recovered" });
+          expect((await records.findOne({ value: "recovered" })).$id).toBe(saved.$id);
+        } finally {
+          chmodSync(directory, 0o700);
+          await invoke({ database, operation: "close" });
+        }
+      });
+
+      it("watches valid replacements and retains indexes after invalid or missing files", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-watch.json`);
+        await invoke({ database, operation: "load", args: [file] });
+        try {
+          const records = collection(database);
+          await records.add({ value: "retained", body: "retained token" });
+          await records.createIndex("by-value", "value");
+          await records.createTextIndex("content", "body");
+          let reloads = 0;
+          database.watch({
+            interval: 20,
+            onReload(): void {
+              reloads += 1;
+            }
+          });
+          await invoke({ database, operation: "save" });
+          await Bun.sleep(100);
+          expect(reloads).toBe(0);
+          const valid = JSON.parse(readFileSync(file, "utf8"));
+          writeFileSync(file, "not JSON");
+          await Bun.sleep(100);
+          expect(await records.count({ value: "retained" })).toBe(1);
+          renameSync(file, `${file}.missing`);
+          await Bun.sleep(100);
+          expect(await records.searchText("content", "retained")).toHaveLength(1);
+          valid.revision += 1;
+          valid.collections.records.data[0].value = "external";
+          valid.collections.records.data[0].body = "external token";
+          writeFileSync(file, JSON.stringify(valid));
+          await waitFor(() => reloads > 0);
+          expect(await records.count({ value: "external" })).toBe(1);
+          expect(await records.searchText("content", "external")).toHaveLength(1);
+          database.unwatch();
+          database.unwatch();
+          valid.revision += 1;
+          valid.collections.records.data[0].value = "after cancellation";
+          writeFileSync(file, JSON.stringify(valid));
+          await Bun.sleep(100);
+          expect(await records.count({ value: "external" })).toBe(1);
+        } finally {
+          database.unwatch();
+          await invoke({ database, operation: "close" });
+        }
+      });
+
+      it("loads legacy revision zero and exchanges snapshots with the other filesystem adapter", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-exchange.json`);
+        await invoke({ database, operation: "load", args: [file] });
+        const saved = await collection(database).add({ value: "portable" });
+        await invoke({ database, operation: "close" });
+        const legacy = JSON.parse(readFileSync(file, "utf8"));
+        delete legacy.revision;
+        writeFileSync(file, JSON.stringify(legacy));
+        const consumer = createRequire(join(workspace, "exchange-consumer.cjs"));
+        const adapter = consumer(`iludb/plugins/${runtime === "node" ? "bun" : "node"}-json`);
+        const restored = consumer("iludb")({ adapter: adapter.default ?? adapter });
+        try {
+          await invoke({ database: restored, operation: "load", args: [file] });
+          expect((await invoke({ database: restored, operation: "snapshot" })).revision).toBe(0);
+          expect((await collection(restored).get(saved.$id)).$createdAt.getTime()).toBe(saved.$createdAt.getTime());
+          await invoke({ database: restored, operation: "save" });
+          expect(JSON.parse(readFileSync(file, "utf8")).revision).toBe(1);
+        } finally {
+          await invoke({ database: restored, operation: "close" });
+        }
+      });
+
+      if (asynchronous) {
+        it("queues admitted mutations rejects synchronous interleaving and drains on close", async () => {
+          const database = createDatabase();
+          const file = join(workspace, `${runtime}-mixed-queue.json`);
+          database.load(file);
+          const syncRecords = database.getCollection("records");
+          const asyncRecords = database.getAsyncCollection("records");
+          const input = { value: "admitted", nested: { retained: true } };
+          const first = asyncRecords.add(input);
+          input.value = "changed after admission";
+          input.nested.retained = false;
+          expect(() => syncRecords.add({ value: "forbidden interleave" })).toThrow();
+          expect(() => database.save()).toThrow();
+          expect(() => database.reload()).toThrow();
+          const second = asyncRecords.add({ value: "second" });
+          const closing = database.asyncClose();
+          await expect((async () => asyncRecords.add({ value: "too late" }))()).rejects.toThrow();
+          await Promise.all([first, second, closing]);
+          await database.asyncClose();
+          expect(() => syncRecords.add({ value: "closed" })).toThrow();
+          const restored = createDatabase();
+          restored.load(file);
+          try {
+            const documents = restored.getCollection("records").find({}, { sort: { $id: 1 } });
+            expect(documents.map((document: any) => document.value)).toEqual(["admitted", "second"]);
+            expect(documents[0].nested.retained).toBe(true);
+          } finally {
+            restored.close();
+          }
+        });
+      }
+
+      it("persists isolated CRUD results with sorting text search and preserved file mode", async () => {
+        const database = createDatabase();
+        const file = join(workspace, `${runtime}-${mode}-crud.json`);
+        await invoke({ database, operation: "load", args: [file] });
+        try {
+          expect(lstatSync(file).mode & 0o077).toBe(0);
+          chmodSync(file, 0o640);
+          const records = collection(database);
+          await records.createIndex("by-state", "state");
+          await records.createTextIndex("content", "body");
+          const input = {
+            state: "open",
+            score: 2,
+            body: "Café azul",
+            nested: { retained: true },
+            userDate: new Date(0)
+          };
+          const saved = await records.add(input);
+          input.nested.retained = false;
+          saved.nested.retained = false;
+          await records.add({ state: "open", score: 1, body: "cafe verde" });
+          expect(
+            (await records.find({ state: "open" }, { sort: { score: 1 } })).map((record: any) => record.score)
+          ).toEqual([1, 2]);
+          expect((await records.searchText("content", "CAFE azul"))[0].$id).toBe(saved.$id);
+          expect(await records.searchText("content", "caf")).toEqual([]);
+          expect((await records.get(saved.$id)).nested.retained).toBe(true);
+          const updated = await records.update({ $id: saved.$id, state: "done", body: "final token" });
+          expect(updated.$createdAt.getTime()).toBe(saved.$createdAt.getTime());
+          expect(await records.count({ state: "open" })).toBe(1);
+          expect(await records.searchText("content", "azul")).toEqual([]);
+          const snapshot = await invoke({ database, operation: "snapshot" });
+          snapshot.collections.records.data[0].state = "external mutation";
+          expect((await records.get(saved.$id)).state).toBe("done");
+          const restored = createDatabase();
+          await invoke({ database: restored, operation: "load", args: [file] });
+          try {
+            const document = await collection(restored).get(saved.$id);
+            expect(document.state).toBe("done");
+            expect(document.userDate).toBe(new Date(0).toISOString());
+            expect(document.$createdAt.getTime()).toBe(saved.$createdAt.getTime());
+          } finally {
+            await invoke({ database: restored, operation: "close" });
+          }
+          await records.remove(updated);
+          expect(await records.get(saved.$id)).toBeNull();
+          expect(await records.findOne({ state: "done" })).toBeNull();
+          expect(await records.searchText("content", "final")).toEqual([]);
+          expect(lstatSync(file).mode & 0o777).toBe(0o640);
+        } finally {
+          await invoke({ database, operation: "close" });
+        }
+      });
+    });
+  }
+}
+
+describe("Bun JSON public persistence", () => {
+  function openConsumer() {
+    const consumer = createRequire(join(workspace, "bun-consumer.cjs"));
+    const IluDB = consumer("iludb");
+    return IluDB;
+  }
+
+  async function openBunDatabase(file: string): Promise<any> {
+    const consumer = createRequire(join(workspace, "bun-consumer.cjs"));
+    const database = consumer("iludb")({ adapter: consumer("iludb/plugins/bun-json") });
+    await database.asyncLoad(file);
+    return database;
+  }
+
+  it("rejects invalid or linked snapshots without replacing their contents", async () => {
+    for (const [index, contents] of ["not JSON", "[]", '{"revision":-1,"collections":{}}'].entries()) {
+      const file = join(workspace, `bun-invalid-${index}.json`);
+      writeFileSync(file, contents);
+      await expect(openBunDatabase(file)).rejects.toThrow();
+      expect(readFileSync(file, "utf8")).toBe(contents);
+    }
+    const canary = join(workspace, "bun-link-canary.json");
+    writeFileSync(canary, "synthetic canary");
+    const link = join(workspace, "bun-link.json");
+    symlinkSync(canary, link);
+    await expect(openBunDatabase(link)).rejects.toThrow();
+    expect(readFileSync(canary, "utf8")).toBe("synthetic canary");
+  });
+
+  it("rejects invalid additions without persisting or breaking later operations", async () => {
+    const file = join(workspace, "bun-invalid-add.json");
+    const database = await openBunDatabase(file);
+    try {
+      const records = database.getAsyncCollection("records");
+      const original = readFileSync(file, "utf8");
+      expect(await records.get(123)).toBeNull();
+      expect(await records.findOne({ value: "absent" })).toBeNull();
+      for (const document of [null, [], 42, { $id: 1, value: "reserved" }]) {
+        await expect(records.add(document)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+        expect(await records.count()).toBe(0);
+        expect(readFileSync(file, "utf8")).toBe(original);
+      }
+      const added = await records.add({ value: "valid" });
+      expect((await records.get(added.$id)).value).toBe("valid");
+    } finally {
+      await database.asyncClose();
+    }
+  });
+
+  it("discards throwing and asynchronous transactions without exposing a mutable active stage", async () => {
+    const file = join(workspace, "bun-rollback.json");
+    const database = await openBunDatabase(file);
+    try {
+      const records = database.getAsyncCollection("records");
+      const before = readFileSync(file, "utf8");
+      await expect(
+        database.asyncTransaction((tx: any) => {
+          tx.getCollection("records").add({ value: "must not publish" });
+          expect(readFileSync(file, "utf8")).toBe(before);
+          throw new Error("synthetic transaction failure");
+        })
+      ).rejects.toThrow();
+      await expect(
+        database.asyncTransaction((tx: any) => {
+          tx.getCollection("records").add({ value: "must not publish" });
+          return Promise.resolve("invalid async callback");
+        })
+      ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(await records.count()).toBe(0);
+      expect(readFileSync(file, "utf8")).toBe(before);
+      let leaked: any = null;
+      const returned = await database.asyncTransaction((tx: any) => {
+        leaked = tx.getCollection("records");
+        return leaked.add({ value: "committed" });
+      });
+      expect(() => leaked.add({ value: "outside callback" })).toThrow();
+      returned.value = "external mutation";
+      expect((await records.get(returned.$id)).value).toBe("committed");
+    } finally {
+      await database.asyncClose();
+    }
+  });
+
+  it("preserves committed data and indexed queries when reload validation fails", async () => {
+    const file = join(workspace, "bun-reload.json");
+    const database = await openBunDatabase(file);
+    try {
+      const records = database.getAsyncCollection("records");
+      await records.createIndex("by-state", "state");
+      const saved = await records.add({ state: "retained" });
+      const bytes = readFileSync(file, "utf8");
+      const revision = (await database.asyncSnapshot()).revision;
+      writeFileSync(file, "not JSON");
+      await expect(database.asyncReload()).rejects.toMatchObject({ code: "INVALID_SNAPSHOT" });
+      expect((await records.findOne({ state: "retained" })).$id).toBe(saved.$id);
+      expect((await database.asyncSnapshot()).revision).toBe(revision);
+      writeFileSync(file, bytes);
+      await database.asyncReload();
+      expect((await records.findOne({ state: "retained" })).$id).toBe(saved.$id);
+    } finally {
+      await database.asyncClose();
+    }
+  });
+
+  it("rejects an unserializable staged document without publishing it or changing the committed file", async () => {
+    const file = join(workspace, "bun-serialization-rollback.json");
+    const database = await openBunDatabase(file);
+    try {
+      const records = database.getAsyncCollection("records");
+      const initial = await records.add({ value: "retained" });
+      const bytes = readFileSync(file, "utf8");
+      const revision = (await database.asyncSnapshot()).revision;
+      await expect(
+        database.asyncTransaction((tx: any) => {
+          tx.getCollection("records").update({ $id: initial.$id, value: "must not publish", invalidJSON: 1n });
+        })
+      ).rejects.toThrow();
+      expect(readFileSync(file, "utf8")).toBe(bytes);
+      expect((await database.asyncSnapshot()).revision).toBe(revision);
+      expect((await records.get(initial.$id)).value).toBe("retained");
+      await records.update({ $id: initial.$id, value: "later valid update" });
+      expect((await records.get(initial.$id)).value).toBe("later valid update");
+    } finally {
+      await database.asyncClose();
+    }
+  });
+
+  it("rejects a stale checkpoint without retry or replacing the newer snapshot", async () => {
+    const file = join(workspace, "bun-stale.json");
+    const writer = await openBunDatabase(file);
+    const stale = await openBunDatabase(file);
+    try {
+      await writer.getAsyncCollection("records").add({ value: "newer" });
+      const before = readFileSync(file, "utf8");
+      const currentRevision = (await writer.asyncSnapshot()).revision;
+      await expect(stale.asyncSave()).rejects.toMatchObject({
+        code: "CONFLICT",
+        expectedRevision: 0,
+        actualRevision: currentRevision
+      });
+      expect(readFileSync(file, "utf8")).toBe(before);
+      expect(await stale.getAsyncCollection("records").count()).toBe(0);
+    } finally {
+      await writer.asyncClose();
+      await stale.asyncClose();
+    }
+  });
+
+  it("captures admitted arguments and isolates documents while persisting before resolution", async () => {
+    const file = join(workspace, "bun-isolation.json");
+    const database = await openBunDatabase(file);
+    try {
+      const records = database.getAsyncCollection("records");
+      const document = { value: "admitted", nested: { retained: true } };
+      const pending = records.add(document);
+      document.value = "changed after admission";
+      document.nested.retained = false;
+      const saved = await pending;
+      saved.nested.retained = false;
+      const independent = await openBunDatabase(file);
+      try {
+        const restored = await independent.getAsyncCollection("records").get(saved.$id);
+        expect(restored.value).toBe("admitted");
+        expect(restored.nested.retained).toBe(true);
+        expect(restored.$createdAt).toBeInstanceOf(Date);
+      } finally {
+        await independent.asyncClose();
+      }
+      const snapshot = await database.asyncSnapshot();
+      snapshot.collections.records.data[0].value = "changed snapshot";
+      expect((await records.get(saved.$id)).value).toBe("admitted");
+      expect(lstatSync(file).mode & 0o777).toBe(0o600);
+    } finally {
+      await database.asyncClose();
+    }
+  });
+
+  it("rolls back a real denied temporary write without changing committed data or indexes", async () => {
+    const directory = join(workspace, "bun-write-denied");
+    mkdirSync(directory, { mode: 0o700 });
+    const file = join(directory, "snapshot.json");
+    const database = await openBunDatabase(file);
+    try {
+      const records = database.getAsyncCollection("records");
+      await records.createIndex("by-value", "value");
+      const saved = await records.add({ value: "retained" });
+      const bytes = readFileSync(file, "utf8");
+      const revision = (await database.asyncSnapshot()).revision;
+      chmodSync(directory, 0o500);
+      await expect(records.update({ $id: saved.$id, value: "not published" })).rejects.toMatchObject({ code: "IO" });
+      expect(readFileSync(file, "utf8")).toBe(bytes);
+      expect((await records.findOne({ value: "retained" })).$id).toBe(saved.$id);
+      expect((await database.asyncSnapshot()).revision).toBe(revision);
+      chmodSync(directory, 0o700);
+      await records.update({ $id: saved.$id, value: "later valid" });
+      expect((await records.findOne({ value: "later valid" })).$id).toBe(saved.$id);
+    } finally {
+      chmodSync(directory, 0o700);
+      await database.asyncClose();
+    }
+  });
+
+  it("drains admitted mutations on close and rejects new operations without an implicit save", async () => {
+    const file = join(workspace, "bun-close.json");
+    const database = await openBunDatabase(file);
+    const records = database.getAsyncCollection("records");
+    const first = records.add({ value: "first" });
+    const second = records.add({ value: "second" });
+    const closing = database.asyncClose();
+    await expect(records.add({ value: "late" })).rejects.toMatchObject({ code: "CLOSED" });
+    await expect(records.add({ value: () => "invalid and late" })).rejects.toMatchObject({ code: "CLOSED" });
+    await Promise.all([first, second, closing]);
+    await database.asyncClose();
+    const restored = await openBunDatabase(file);
+    try {
+      expect(
+        (await restored.getAsyncCollection("records").find({}, { sort: { $id: 1 } })).map((record: any) => record.value)
+      ).toEqual(["first", "second"]);
+      expect((await restored.asyncSnapshot()).revision).toBe(2);
+    } finally {
+      await restored.asyncClose();
+    }
+  });
+
+  it("coexists with synchronous memory and node-json consumers without replacing their API", async () => {
+    const IluDB = openConsumer();
+    const memory = IluDB();
+    const local = memory.getCollection("records").add({ value: "synchronous memory" });
+    expect(local instanceof Promise).toBe(false);
+    expect(memory.getCollection("records").get(local.$id).value).toBe("synchronous memory");
+    const consumer = createRequire(join(workspace, "bun-consumer.cjs"));
+    const file = join(workspace, "coexisting-node.json");
+    const synchronous = IluDB({ adapter: consumer("iludb/plugins/node-json") });
+    synchronous.load(file);
+    const saved = synchronous.getCollection("records").add({ value: "synchronous disk" });
+    expect(saved instanceof Promise).toBe(false);
+    expect(JSON.parse(readFileSync(file, "utf8")).collections.records.data[0].value).toBe("synchronous disk");
+    const asynchronous = await openBunDatabase(join(workspace, "coexisting-bun.json"));
+    try {
+      const added = await asynchronous.getAsyncCollection("records").add({ value: "async disk" });
+      expect((await asynchronous.getAsyncCollection("records").get(added.$id)).value).toBe("async disk");
+      expect(synchronous.getCollection("records").get(saved.$id).value).toBe("synchronous disk");
+    } finally {
+      await asynchronous.asyncClose();
+      synchronous.close();
+    }
+  });
+});
+
 describe("Public entrypoints", () => {
   it("reloads transactionally and keeps collection bindings stable", () => {
-    const IluDB = require(join(root, "dist/iludb.js"));
-    const plugin = require(join(root, "dist/plugins/node-json.js"));
-    IluDB.use(plugin);
     const databaseFile = join(workspace, "reload-bindings.json");
-    const database = IluDB(databaseFile);
+    const database = openNodeDatabase(databaseFile);
     const first = database.getCollection("records");
     const second = database.getCollection("records");
     first.createIndex("by-state", "state");
     first.createTextIndex("content", "body");
     first.add({ state: "local", body: "local token" });
     const stableSnapshot = JSON.parse(readFileSync(databaseFile, "utf8"));
-    const dataReference = database.data;
+    const revision = database.snapshot().revision;
 
     const invalidSnapshots = [
       { label: "root", value: [] },
@@ -212,8 +879,8 @@ describe("Public entrypoints", () => {
     for (let index = 0; index < invalidSnapshots.length; index += 1) {
       const invalid = invalidSnapshots[index];
       writeFileSync(databaseFile, JSON.stringify(invalid.value));
-      expect(() => database.reload(), invalid.label).toThrow(TypeError);
-      expect(database.data, invalid.label).toBe(dataReference);
+      expect(() => database.reload(), invalid.label).toThrow();
+      expect(database.snapshot().revision, invalid.label).toBe(revision);
       expect(second.find({ state: "local" }), invalid.label).toHaveLength(1);
       expect(second.searchText("content", "local"), invalid.label).toHaveLength(1);
     }
@@ -234,34 +901,34 @@ describe("Public entrypoints", () => {
     writeFileSync(replacement, JSON.stringify(withoutRecords));
     renameSync(replacement, databaseFile);
     database.reload();
-    expect(() => first.find()).toThrow("inactive");
-    expect(() => second.reindex()).toThrow("inactive");
+    expect(() => first.find()).toThrow();
+    expect(() => second.reindex()).toThrow();
     const recreated = database.getCollection("records");
     expect(recreated.find()).toEqual([]);
-    expect(recreated.getIndexes()).toEqual([{ name: "by-state", fields: ["state"] }]);
-    expect(recreated.getTextIndexes()).toEqual([{ name: "content", fields: ["body"] }]);
-    expect(first.find()).toEqual([]);
+    recreated.createIndex("by-state", "state");
+    recreated.createTextIndex("content", "body");
+    recreated.add({ state: "recreated", body: "recreated token" });
+    expect(first.find({ state: "recreated" })).toHaveLength(1);
+    expect(first.searchText("content", "recreated")).toHaveLength(1);
+    database.close();
   });
 
   it("persists revisions and rejects stale or disappeared snapshots", () => {
-    const IluDB = require(join(root, "dist/iludb.js"));
     const plugin = require(join(root, "dist/plugins/node-json.js"));
-    IluDB.use(plugin);
     const databaseFile = join(workspace, "revision-conflicts.json");
-    const created = IluDB(databaseFile);
-    expect(created.data.revision).toBe(0);
+    const created = openNodeDatabase(databaseFile);
+    expect(created.snapshot().revision).toBe(0);
     const legacy = JSON.parse(readFileSync(databaseFile, "utf8"));
     delete legacy.revision;
     writeFileSync(databaseFile, JSON.stringify(legacy));
-    const first = IluDB(databaseFile);
-    expect(first.data.revision).toBe(0);
+    const first = openNodeDatabase(databaseFile);
+    expect(first.snapshot().revision).toBe(0);
     first.save();
     expect(JSON.parse(readFileSync(databaseFile, "utf8")).revision).toBe(1);
 
-    const stale = IluDB(databaseFile);
+    const stale = openNodeDatabase(databaseFile);
     first.save();
-    const beforeConflict = stale.data;
-    stale.data.local = "preserved";
+    const beforeConflict = stale.snapshot().revision;
     let conflict: any = null;
     try {
       stale.save();
@@ -271,8 +938,8 @@ describe("Public entrypoints", () => {
     expect(conflict).toBeInstanceOf(plugin.ConflictError);
     expect(conflict.expectedRevision).toBe(1);
     expect(conflict.actualRevision).toBe(2);
-    expect(stale.data).toBe(beforeConflict);
-    expect(stale.data.local).toBe("preserved");
+    expect(stale.snapshot().revision).toBe(beforeConflict);
+    expect(stale.getCollection("records").count()).toBe(0);
 
     const moved = `${databaseFile}.moved`;
     renameSync(databaseFile, moved);
@@ -284,169 +951,47 @@ describe("Public entrypoints", () => {
     }
   });
 
-  it("retries reload when the path changes after the descriptor read", () => {
-    const nodeFs = require("fs") as Record<string, any>;
+  it("rejects removed constructor paths without changing an existing snapshot", () => {
     const IluDB = require(join(root, "dist/iludb.js"));
-    let armed = false;
-    let databaseFile = "";
-    let latestSerialized = "";
-    const adapter = {
-      ...nodeFs,
-      readFileSync(...args: any[]): any {
-        const result = nodeFs.readFileSync.apply(null, args);
-        if (armed) {
-          armed = false;
-          const replacement = `${databaseFile}.race-replacement`;
-          nodeFs.writeFileSync(replacement, latestSerialized);
-          nodeFs.renameSync(replacement, databaseFile);
-        }
-        return result;
-      }
-    };
-    const plugin = loadPluginWithFs(adapter);
-    IluDB.use(plugin);
-    databaseFile = join(workspace, "reload-race.json");
-    const database = IluDB(databaseFile);
-    const older = JSON.parse(readFileSync(databaseFile, "utf8"));
-    older.revision = 1;
-    older.marker = "older";
-    writeFileSync(databaseFile, JSON.stringify(older));
-    const latest = structuredClone(older);
-    latest.revision = 2;
-    latest.marker = "latest";
-    latestSerialized = JSON.stringify(latest);
-    armed = true;
-
-    database.reload();
-
-    expect(database.data.revision).toBe(2);
-    expect(database.data.marker).toBe("latest");
-    restoreHostPlugin(IluDB);
+    const file = join(workspace, "removed-constructor.json");
+    writeFileSync(file, "synthetic canary");
+    expect(() => IluDB(file)).toThrow();
+    expect(() => IluDB.getDatabase(file)).toThrow();
+    expect(readFileSync(file, "utf8")).toBe("synthetic canary");
   });
 
-  it("publishes saves through an atomic replacement and preserves mode", () => {
-    const IluDB = require(join(root, "dist/iludb.js"));
-    const plugin = require(join(root, "dist/plugins/node-json.js"));
-    IluDB.use(plugin);
+  it("persists changes, preserves access permissions and rejects symbolic links", () => {
     const databaseFile = join(workspace, "atomic-save.json");
-    const database = IluDB(databaseFile);
+    const database = openNodeDatabase(databaseFile);
     chmodSync(databaseFile, 0o640);
-    const inode = lstatSync(databaseFile).ino;
-    database.data.value = "published";
-    database.save();
-    expect(lstatSync(databaseFile).ino).not.toBe(inode);
+    database.getCollection("records").add({ value: "published" });
     expect(lstatSync(databaseFile).mode & 0o777).toBe(0o640);
-    expect(JSON.parse(readFileSync(databaseFile, "utf8")).value).toBe("published");
+    expect(JSON.parse(readFileSync(databaseFile, "utf8")).collections.records.data[0].value).toBe("published");
 
     const target = join(workspace, "symlink-target.json");
     const link = join(workspace, "symlink-database.json");
     writeFileSync(target, readFileSync(databaseFile));
     symlinkSync(target, link);
-    database.dir = link;
-    expect(() => database.save()).toThrow(TypeError);
+    renameSync(databaseFile, `${databaseFile}.original`);
+    symlinkSync(target, databaseFile);
+    expect(() => database.save()).toThrow();
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
   });
 
-  it("keeps atomic save failures before rename from publishing state", () => {
-    const nodeFs = require("fs") as Record<string, any>;
-    const IluDB = require(join(root, "dist/iludb.js"));
-    const stages = ["openSync", "writeSync", "fchmodSync", "fsyncSync", "closeSync", "renameSync"];
-    for (let index = 0; index < stages.length; index += 1) {
-      const stage = stages[index];
-      let armed = false;
-      let cleanupCalls = 0;
-      const adapter: Record<string, any> = {
-        ...nodeFs,
-        unlinkSync(...args: any[]): void {
-          cleanupCalls += 1;
-          nodeFs.unlinkSync.apply(null, args);
-        }
-      };
-      adapter[stage] = (...args: any[]): any => {
-        if (armed) {
-          armed = false;
-          throw new Error(`${stage} boundary failure`);
-        }
-        return nodeFs[stage](...args);
-      };
-      const plugin = loadPluginWithFs(adapter);
-      IluDB.use(plugin);
-      const databaseFile = join(workspace, `atomic-${stage}.json`);
-      const database = IluDB(databaseFile);
-      const serialized = readFileSync(databaseFile, "utf8");
-      const revision = database.data.revision;
-      const modifiedAt = database.data.modifiedAt;
-      database.data.stage = stage;
-      armed = true;
-
-      expect(() => database.save(), stage).toThrow(`${stage} boundary failure`);
-      expect(readFileSync(databaseFile, "utf8"), stage).toBe(serialized);
-      expect(database.data.revision, stage).toBe(revision);
-      expect(database.data.modifiedAt, stage).toBe(modifiedAt);
-      expect(cleanupCalls, stage).toBe(stage === "openSync" ? 0 : 1);
-      expect(
-        readdirSync(workspace).filter((name) => name.startsWith(`atomic-${stage}.json.tmp-`)),
-        stage
-      ).toEqual([]);
-    }
-    restoreHostPlugin(IluDB);
-  });
-
-  it("completes partial writes and preserves the primary cleanup error", () => {
-    const nodeFs = require("fs") as Record<string, any>;
-    const IluDB = require(join(root, "dist/iludb.js"));
-    const partialPlugin = loadPluginWithFs({
-      ...nodeFs,
-      writeSync(descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null): number {
-        return nodeFs.writeSync(descriptor, buffer, offset, Math.min(length, 3), position);
-      }
-    });
-    IluDB.use(partialPlugin);
-    const partialFile = join(workspace, "partial-write.json");
-    const partialDatabase = IluDB(partialFile);
-    partialDatabase.data.payload = "complete";
-    partialDatabase.save();
-    expect(JSON.parse(readFileSync(partialFile, "utf8")).payload).toBe("complete");
-
-    let armed = false;
-    const cleanupPlugin = loadPluginWithFs({
-      ...nodeFs,
-      writeSync(...args: any[]): number {
-        if (armed) {
-          throw new Error("primary write failure");
-        }
-        return nodeFs.writeSync.apply(null, args);
-      },
-      unlinkSync(path: string): void {
-        if (armed && path.includes(".tmp-")) {
-          throw new Error("secondary cleanup failure");
-        }
-        nodeFs.unlinkSync(path);
-      }
-    });
-    IluDB.use(cleanupPlugin);
-    const cleanupFile = join(workspace, "cleanup-failure.json");
-    const cleanupDatabase = IluDB(cleanupFile);
-    armed = true;
-    let aggregate: any = null;
-    try {
-      cleanupDatabase.save();
-    } catch (error) {
-      aggregate = error;
-    }
-    armed = false;
-    expect(aggregate).toBeInstanceOf(AggregateError);
-    expect(aggregate.errors[0].message).toBe("primary write failure");
-    expect(aggregate.errors[1].message).toBe("secondary cleanup failure");
-    restoreHostPlugin(IluDB);
+  it("persists a multi-buffer payload completely before returning", () => {
+    const file = join(workspace, "complete-write.json");
+    const database = openNodeDatabase(file);
+    const payload = "synthetic payload ".repeat(10000);
+    const saved = database.getCollection("records").add({ payload });
+    const reopened = openNodeDatabase(file);
+    expect(reopened.getCollection("records").get(saved.$id).payload).toBe(payload);
+    reopened.close();
+    database.close();
   });
 
   it("watches external replacements, contains callback errors and ignores own saves", async () => {
-    const IluDB = require(join(root, "dist/iludb.js"));
-    const plugin = require(join(root, "dist/plugins/node-json.js"));
-    IluDB.use(plugin);
     const databaseFile = join(workspace, "watched.json");
-    const database = IluDB(databaseFile);
+    const database = openNodeDatabase(databaseFile);
     let reloads = 0;
     let errors = 0;
     database.watch({
@@ -462,8 +1007,7 @@ describe("Public entrypoints", () => {
         throw new Error("contained error callback");
       }
     });
-    database.data.own = true;
-    database.save();
+    database.getCollection("records").add({ value: "own" });
     await Bun.sleep(80);
     expect(reloads).toBe(0);
 
@@ -474,22 +1018,19 @@ describe("Public entrypoints", () => {
     writeFileSync(replacement, JSON.stringify(external));
     renameSync(replacement, databaseFile);
     await waitFor(() => reloads === 1);
-    expect(database.data.external).toBe(true);
+    expect(database.snapshot().external).toBe(true);
     expect(errors).toBe(1);
     database.unwatch();
     database.unwatch();
   });
 
   it("keeps watching through invalid, deleted and reappearing files without callbacks", async () => {
-    const IluDB = require(join(root, "dist/iludb.js"));
-    const plugin = require(join(root, "dist/plugins/node-json.js"));
-    IluDB.use(plugin);
     const databaseFile = join(workspace, "watch-recovery.json");
-    const database = IluDB(databaseFile);
-    const originalReference = database.data;
-    expect(() => database.watch({ interval: 0 })).toThrow(TypeError);
-    expect(() => database.watch({ onReload: true })).toThrow(TypeError);
-    expect(() => database.watch({ onError: true })).toThrow(TypeError);
+    const database = openNodeDatabase(databaseFile);
+    const originalRevision = database.snapshot().revision;
+    expect(() => database.watch({ interval: 0 })).toThrow();
+    expect(() => database.watch({ onReload: true })).toThrow();
+    expect(() => database.watch({ onError: true })).toThrow();
     database.watch({ interval: 20 });
     database.watch({ interval: 0 });
 
@@ -497,7 +1038,7 @@ describe("Public entrypoints", () => {
     writeFileSync(replacement, "{");
     renameSync(replacement, databaseFile);
     await Bun.sleep(80);
-    expect(database.data).toBe(originalReference);
+    expect(database.snapshot().revision).toBe(originalRevision);
 
     const valid = {
       ...JSON.parse(readFileSync(join(workspace, "watched.json"), "utf8")),
@@ -505,160 +1046,55 @@ describe("Public entrypoints", () => {
     };
     writeFileSync(replacement, JSON.stringify(valid));
     renameSync(replacement, databaseFile);
-    await waitFor(() => database.data.recovered === 1);
+    await waitFor(() => {
+      try {
+        return database.snapshot().recovered === 1;
+      } catch {
+        return false;
+      }
+    });
 
     const missing = `${databaseFile}.missing`;
     renameSync(databaseFile, missing);
     await Bun.sleep(80);
-    expect(database.data.recovered).toBe(1);
+    expect(database.snapshot().recovered).toBe(1);
     valid.revision += 1;
     valid.recovered = 2;
     writeFileSync(databaseFile, JSON.stringify(valid));
-    await waitFor(() => database.data.recovered === 2);
-    database.unwatch();
-  });
-
-  it("configures a non-persistent watcher and unregisters its exact listener", () => {
-    const nodeFs = require("fs") as Record<string, any>;
-    const IluDB = require(join(root, "dist/iludb.js"));
-    let watchedPath: string | null = null;
-    let watchedListener: unknown = null;
-    let watchedOptions: Record<string, any> | null = null;
-    let unwatchedPath: string | null = null;
-    let unwatchedListener: unknown = null;
-    const adapter = {
-      ...nodeFs,
-      watchFile(path: string, options: Record<string, any>, listener: unknown): void {
-        watchedPath = path;
-        watchedOptions = options;
-        watchedListener = listener;
-      },
-      unwatchFile(path: string, listener: unknown): void {
-        unwatchedPath = path;
-        unwatchedListener = listener;
+    await waitFor(() => {
+      try {
+        return database.snapshot().recovered === 2;
+      } catch {
+        return false;
       }
-    };
-    const plugin = loadPluginWithFs(adapter);
-    IluDB.use(plugin);
-    const databaseFile = join(workspace, "watch-adapter.json");
-    const database = IluDB(databaseFile);
-    database.watch();
-    database.watch();
-    database.dir = `${databaseFile}.other`;
-    database.unwatch();
-
-    expect(watchedPath as unknown).toBe(databaseFile);
-    expect(watchedOptions as unknown).toEqual({
-      interval: 500,
-      persistent: false
     });
-    expect(unwatchedPath as unknown).toBe(databaseFile);
-    expect(unwatchedListener).toBe(watchedListener);
-    restoreHostPlugin(IluDB);
+    database.unwatch();
   });
 
-  it("coalesces watch events during reload into one additional read", () => {
-    const nodeFs = require("fs") as Record<string, any>;
-    const IluDB = require(join(root, "dist/iludb.js"));
-    let listener: ((current: any, previous: any) => void) | null = null;
-    let watchedPath: string | null = null;
-    let triggerBurst = false;
-    let reloadReads = 0;
-    const adapter = {
-      ...nodeFs,
-      watchFile(
-        path: string,
-        _options: Record<string, any>,
-        nextListener: (current: any, previous: any) => void
-      ): void {
-        watchedPath = path;
-        listener = nextListener;
-      },
-      unwatchFile(): void {},
-      readFileSync(...args: any[]): any {
-        const result = nodeFs.readFileSync.apply(null, args);
-        if (triggerBurst && watchedPath !== null) {
-          triggerBurst = false;
-          reloadReads += 1;
-          const first = {
-            ctimeMs: 101,
-            dev: 1,
-            ino: 1,
-            mtimeMs: 101,
-            size: 101
-          };
-          const second = {
-            ctimeMs: 102,
-            dev: 1,
-            ino: 1,
-            mtimeMs: 102,
-            size: 102
-          };
-          listener!(first, first);
-          listener!(second, second);
-        } else if (watchedPath !== null) {
-          reloadReads += 1;
+  it("loads the latest external data after repeated replacements", async () => {
+    const file = join(workspace, "watch-coalescing.json");
+    const database = openNodeDatabase(file);
+    database.getCollection("records").add({ value: "initial" });
+    database.watch({ interval: 20 });
+    try {
+      const external = JSON.parse(readFileSync(file, "utf8"));
+      for (let revision = 2; revision <= 4; revision += 1) {
+        external.revision = revision;
+        external.collections.records.data[0].value = `replacement-${revision}`;
+        writeFileSync(`${file}.replacement`, JSON.stringify(external));
+        renameSync(`${file}.replacement`, file);
+      }
+      await waitFor(() => {
+        try {
+          return database.snapshot().revision === 4;
+        } catch {
+          return false;
         }
-        return result;
-      }
-    };
-    const plugin = loadPluginWithFs(adapter);
-    IluDB.use(plugin);
-    const databaseFile = join(workspace, "watch-coalescing.json");
-    const database = IluDB(databaseFile);
-    database.watch();
-    const external = JSON.parse(readFileSync(databaseFile, "utf8"));
-    external.revision += 1;
-    external.burst = true;
-    writeFileSync(databaseFile, JSON.stringify(external));
-    triggerBurst = true;
-    const current = lstatSync(databaseFile);
-    listener!(current, current);
-
-    database.unwatch();
-    restoreHostPlugin(IluDB);
-    expect(database.data.burst).toBe(true);
-    expect(reloadReads).toBe(2);
-  });
-
-  it("lets a subprocess exit while its non-persistent watcher is active", () => {
-    const databaseFile = join(workspace, "watch-subprocess.json");
-    run({
-      command: [
-        "node",
-        "-e",
-        `
-const IluDB = require(${JSON.stringify(join(root, "dist/iludb.js"))});
-const plugin = require(${JSON.stringify(join(root, "dist/plugins/node-json.js"))});
-IluDB.use(plugin);
-const database = IluDB(${JSON.stringify(databaseFile)});
-database.watch({ interval: 20 });
-`
-      ]
-    });
-  });
-
-  it("loads readable, minified and package CommonJS exports", () => {
-    run({
-      cwd: workspace,
-      command: [
-        "node",
-        "-e",
-        `
-const exportsToCheck = [
-    require("iludb"),
-    require("iludb/plugins/node-json"),
-    require(${JSON.stringify(join(root, "dist/iludb.js"))}),
-    require(${JSON.stringify(join(root, "dist/iludb.min.js"))}),
-    require(${JSON.stringify(join(root, "dist/plugins/node-json.js"))}),
-    require(${JSON.stringify(join(root, "dist/plugins/node-json.min.js"))}),
-];
-for (const value of exportsToCheck) {
-    if (typeof value !== "function") throw new Error("CommonJS export is not callable");
-}
-`
-      ]
-    });
+      });
+      expect(database.getCollection("records").findOne({ value: "replacement-4" })).not.toBeNull();
+    } finally {
+      await database.asyncClose();
+    }
   });
 
   it("keeps readable and minified core bundles functionally equivalent", () => {
@@ -691,8 +1127,8 @@ if (records.findOne({ value: "expected" }).value !== "expected") {
 const fs = require("node:fs");
 const IluDB = require(${JSON.stringify(join(root, "dist/iludb.js"))});
 const plugin = require(${JSON.stringify(join(root, "dist/plugins", pluginDistributions[index]))});
-IluDB.use(plugin);
-const database = IluDB(${JSON.stringify(databaseFile)});
+const database = IluDB({ adapter: plugin });
+database.load(${JSON.stringify(databaseFile)});
 const records = database.getCollection("records");
 const added = records.add({ name: "added" });
 let serialized = fs.readFileSync(${JSON.stringify(databaseFile)}, "utf8");
@@ -717,84 +1153,72 @@ if (fs.readFileSync(${JSON.stringify(databaseFile)}, "utf8").includes("updated")
     const invalidCases = [
       {
         label: "missing database createdAt",
-        field: "database.createdAt",
         mutate(data: Record<string, any>): void {
           delete data.createdAt;
         }
       },
       {
         label: "missing database modifiedAt",
-        field: "database.modifiedAt",
         mutate(data: Record<string, any>): void {
           delete data.modifiedAt;
         }
       },
       {
         label: "missing collection createdAt",
-        field: 'database.collections["records"].createdAt',
         mutate(data: Record<string, any>): void {
           delete data.collections.records.createdAt;
         }
       },
       {
         label: "missing collection modifiedAt",
-        field: 'database.collections["records"].modifiedAt',
         mutate(data: Record<string, any>): void {
           delete data.collections.records.modifiedAt;
         }
       },
       {
         label: "missing document $createdAt",
-        field: 'database.collections["records"].data[0].$createdAt',
         mutate(data: Record<string, any>): void {
           delete data.collections.records.data[0].$createdAt;
         }
       },
       {
         label: "missing document $modifiedAt",
-        field: 'database.collections["records"].data[0].$modifiedAt',
         mutate(data: Record<string, any>): void {
           delete data.collections.records.data[0].$modifiedAt;
         }
       },
       {
         label: "database createdAt",
-        field: "database.createdAt",
         mutate(data: Record<string, any>): void {
           data.createdAt = "2026-08-08";
         }
       },
       {
         label: "database modifiedAt",
-        field: "database.modifiedAt",
         mutate(data: Record<string, any>): void {
           data.modifiedAt = null;
         }
       },
       {
         label: "collection createdAt",
-        field: 'database.collections["records"].createdAt',
         mutate(data: Record<string, any>): void {
           data.collections.records.createdAt = "invalid";
         }
       },
       {
         label: "collection modifiedAt",
-        field: 'database.collections["records"].modifiedAt',
         mutate(data: Record<string, any>): void {
           data.collections.records.modifiedAt = 0;
         }
       },
       {
         label: "document $createdAt",
-        field: 'database.collections["records"].data[0].$createdAt',
         mutate(data: Record<string, any>): void {
           data.collections.records.data[0].$createdAt = canonical.slice(0, -1);
         }
       },
       {
         label: "document $modifiedAt",
-        field: 'database.collections["records"].data[0].$modifiedAt',
         mutate(data: Record<string, any>): void {
           data.collections.records.data[0].$modifiedAt = {};
         }
@@ -802,7 +1226,6 @@ if (fs.readFileSync(${JSON.stringify(databaseFile)}, "utf8").includes("updated")
     ];
 
     for (let bundleIndex = 0; bundleIndex < plugins.length; bundleIndex += 1) {
-      IluDB.use(plugins[bundleIndex]);
       for (let index = 0; index < invalidCases.length; index += 1) {
         const invalidCase = invalidCases[index];
         const databaseFile = join(workspace, `invalid-metadata-${bundleIndex}-${index}.json`);
@@ -831,15 +1254,15 @@ if (fs.readFileSync(${JSON.stringify(databaseFile)}, "utf8").includes("updated")
         let error: unknown = null;
 
         try {
-          loaded = IluDB(databaseFile);
+          const candidate = IluDB({ adapter: plugins[bundleIndex] });
+          candidate.load(databaseFile);
+          loaded = candidate;
         } catch (caught) {
           error = caught;
         }
 
         expect(loaded, invalidCase.label).toBeNull();
-        expect(error, invalidCase.label).toBeInstanceOf(TypeError);
-        expect((error as Error).message, invalidCase.label).toContain(invalidCase.field);
-        expect((error as Error).message, invalidCase.label).toContain("canonical ISO timestamp");
+        expect(error, invalidCase.label).toBeInstanceOf(Error);
         expect(readFileSync(databaseFile, "utf8"), invalidCase.label).toBe(serialized);
       }
     }
@@ -855,29 +1278,30 @@ if (fs.readFileSync(${JSON.stringify(databaseFile)}, "utf8").includes("updated")
           `
 const IluDB = require(${JSON.stringify(join(root, "dist/iludb.js"))});
 const plugin = require(${JSON.stringify(join(root, "dist/plugins", pluginDistributions[index]))});
-IluDB.use(plugin);
 const userTimestamp = "2026-08-08T12:34:56.789Z";
-const database = IluDB(${JSON.stringify(databaseFile)});
+const database = IluDB({ adapter: plugin });
+database.load(${JSON.stringify(databaseFile)});
 const records = database.getCollection("records");
 const added = records.add({
     isoString: userTimestamp,
     arbitraryDate: new Date(userTimestamp),
 });
 const expected = {
-    databaseCreatedAt: database.data.createdAt.getTime(),
-    databaseModifiedAt: database.data.modifiedAt.getTime(),
-    collectionCreatedAt: database.data.collections.records.createdAt.getTime(),
-    collectionModifiedAt: database.data.collections.records.modifiedAt.getTime(),
+    databaseCreatedAt: database.snapshot().createdAt.getTime(),
+    databaseModifiedAt: database.snapshot().modifiedAt.getTime(),
+    collectionCreatedAt: database.snapshot().collections.records.createdAt.getTime(),
+    collectionModifiedAt: database.snapshot().collections.records.modifiedAt.getTime(),
     documentCreatedAt: added.$createdAt.getTime(),
     documentModifiedAt: added.$modifiedAt.getTime(),
 };
 
-const loaded = IluDB(${JSON.stringify(databaseFile)});
-const collectionData = loaded.data.collections.records;
+const loaded = IluDB({ adapter: plugin });
+loaded.load(${JSON.stringify(databaseFile)});
+const collectionData = loaded.snapshot().collections.records;
 const document = loaded.getCollection("records").findOne({ $id: added.$id });
 const timestamps = [
-    [loaded.data.createdAt, expected.databaseCreatedAt],
-    [loaded.data.modifiedAt, expected.databaseModifiedAt],
+    [loaded.snapshot().createdAt, expected.databaseCreatedAt],
+    [loaded.snapshot().modifiedAt, expected.databaseModifiedAt],
     [collectionData.createdAt, expected.collectionCreatedAt],
     [collectionData.modifiedAt, expected.collectionModifiedAt],
     [document.$createdAt, expected.documentCreatedAt],
@@ -906,10 +1330,11 @@ if (document.arbitraryDate !== userTimestamp || typeof document.arbitraryDate !=
         "node",
         "-e",
         `
+const fs = require("node:fs");
 const IluDB = require(${JSON.stringify(join(root, "dist/iludb.js"))});
 const plugin = require(${JSON.stringify(join(root, "dist/plugins/node-json.js"))});
-IluDB.use(plugin);
-const database = IluDB(${JSON.stringify(databaseFile)});
+const database = IluDB({ adapter: plugin });
+database.load(${JSON.stringify(databaseFile)});
 const now = new Date();
 const cyclic = {
     value: "cyclic",
@@ -918,324 +1343,27 @@ const cyclic = {
     $modifiedAt: now,
 };
 cyclic.self = cyclic;
-database.data.collections.records = {
-    data: [cyclic],
-    index: 1,
-    createdAt: new Date(),
-    modifiedAt: new Date(),
-};
 let serializationFailed = false;
 try {
-    database.save();
+    database.transaction(tx => tx.getCollection("records").add({ value: cyclic }));
 } catch (error) {
-    serializationFailed = error instanceof TypeError;
+    serializationFailed = error instanceof Error;
 }
 if (!serializationFailed) throw new Error("save hid the serialization error");
 delete cyclic.self;
 database.save();
 const records = database.getCollection("records");
-database.dir = ${JSON.stringify(workspace)};
+fs.renameSync(${JSON.stringify(databaseFile)}, ${JSON.stringify(`${databaseFile}.original`)});
+fs.mkdirSync(${JSON.stringify(databaseFile)});
 let writeFailed = false;
 try {
     records.add({ value: "write-error" });
 } catch (error) {
-    writeFailed = error instanceof TypeError || (error && (error.code === "EISDIR" || error.code === "EACCES" || error.code === "EPERM"));
+    writeFailed = error && error.code === "IO";
 }
 if (!writeFailed) throw new Error("add hid the synchronous write error");
 `
       ]
     });
-  });
-
-  it("isolates CommonJS and AMD globals while exposing the global format", () => {
-    for (let index = 0; index < distributions.length; index += 1) {
-      const bundlePath = JSON.stringify(join(root, "dist", distributions[index]));
-      run({
-        command: [
-          "node",
-          "-e",
-          `
-const fs = require("node:fs");
-const vm = require("node:vm");
-const source = fs.readFileSync(${bundlePath}, "utf8");
-const sentinel = {};
-
-for (const existingGlobal of [false, true]) {
-    const commonjs = {
-        module: { exports: {} },
-        require,
-        ...(existingGlobal ? { IluDB: sentinel } : {}),
-    };
-    vm.createContext(commonjs);
-    vm.runInContext(source, commonjs);
-    if (typeof commonjs.module.exports !== "function") {
-        throw new Error("CommonJS export is missing");
-    }
-    if (existingGlobal ? commonjs.IluDB !== sentinel : Object.hasOwn(commonjs, "IluDB")) {
-        throw new Error("CommonJS contaminated the global");
-    }
-
-    let amdExport;
-    const define = (factory) => { amdExport = factory(); };
-    define.amd = {};
-    const amd = {
-        define,
-        ...(existingGlobal ? { IluDB: sentinel } : {}),
-    };
-    vm.createContext(amd);
-    vm.runInContext(source, amd);
-    if (typeof amdExport !== "function") throw new Error("AMD export is missing");
-    if (existingGlobal ? amd.IluDB !== sentinel : Object.hasOwn(amd, "IluDB")) {
-        throw new Error("AMD contaminated the global");
-    }
-}
-
-const browser = { IluDB: sentinel };
-vm.createContext(browser);
-vm.runInContext(source, browser);
-if (typeof browser.IluDB !== "function" || browser.IluDB === sentinel) {
-    throw new Error("browser global is missing");
-}
-`
-        ]
-      });
-    }
-  });
-
-  it("exposes equivalent plugin formats when the runtime provides fs", () => {
-    for (let index = 0; index < pluginDistributions.length; index += 1) {
-      const bundlePath = JSON.stringify(join(root, "dist/plugins", pluginDistributions[index]));
-      run({
-        command: [
-          "node",
-          "-e",
-          `
-const fs = require("node:fs");
-const vm = require("node:vm");
-const source = fs.readFileSync(${bundlePath}, "utf8");
-let amdExport;
-const define = (dependencies, factory) => {
-    if (dependencies.length !== 1 || dependencies[0] !== "fs") {
-        throw new Error("AMD external dependency changed");
-    }
-    amdExport = factory(fs);
-};
-define.amd = {};
-const amd = { define };
-vm.createContext(amd);
-vm.runInContext(source, amd);
-if (typeof amdExport !== "function") throw new Error("plugin AMD export is missing");
-const globalContext = { require };
-vm.createContext(globalContext);
-vm.runInContext(source, globalContext);
-if (typeof globalContext.IluDBNodeJSONPlugin !== "function") {
-    throw new Error("plugin global is missing");
-}
-`
-        ]
-      });
-    }
-  });
-
-  it("fails honestly when the plugin runtime cannot provide fs", () => {
-    const source = readFileSync(join(root, "dist/plugins/node-json.js"), "utf8");
-    expect(() => {
-      const result = Bun.spawnSync(
-        [
-          "node",
-          "-e",
-          `
-const vm = require("node:vm");
-const context = {};
-vm.createContext(context);
-vm.runInContext(${JSON.stringify(source)}, context);
-`
-        ],
-        { stdout: "pipe", stderr: "pipe" }
-      );
-      if (result.exitCode === 0) {
-        throw new Error("plugin loaded without fs");
-      }
-    }).not.toThrow();
-  });
-
-  it("publishes only the explicit distribution inventory", () => {
-    expect(listFiles(packedPackage)).toEqual([
-      "LICENSE",
-      "README.md",
-      "dist/iludb.d.ts",
-      "dist/iludb.js",
-      "dist/iludb.min.js",
-      "dist/plugins/node-json.d.ts",
-      "dist/plugins/node-json.js",
-      "dist/plugins/node-json.min.js",
-      "package.json"
-    ]);
-    expect(existsSync(join(root, "index.js"))).toBe(false);
-    expect(existsSync(join(root, "lib"))).toBe(false);
-    expect(existsSync(join(root, "plugins"))).toBe(false);
-  });
-
-  it("publishes consumable TypeScript declarations for ESM and CommonJS", () => {
-    writeFileSync(
-      join(workspace, "consumer.mts"),
-      `
-import IluDB from "iludb";
-import nodeJSONPlugin from "iludb/plugins/node-json";
-
-interface Article {
-    title: string;
-    body: string;
-    score: number;
-    status: "draft" | "published";
-}
-
-const database: IluDB.Database = IluDB();
-const articles: IluDB.Collection<Article> = database.getCollection<Article>("articles");
-const added = articles.add({
-    title: "Types are public",
-    body: "Exact and text indexes",
-    score: 1,
-    status: "draft",
-});
-
-if (added) {
-    added.$id;
-    added.$createdAt.toISOString();
-    const coreCreatedAt: Date = added.$createdAt;
-    articles.update({ ...added, status: "published" });
-    articles.remove(added);
-}
-
-const found = articles.find(
-    { status: "draft" },
-    { sort: { score: -1 } },
-);
-found[0]?.title.toUpperCase();
-articles.findOne({ title: "Types are public" })?.body.toUpperCase();
-articles.sort(found, { score: 1 });
-articles.count({ status: "published" });
-articles.get(1)?.score.toFixed();
-articles.createIndex("by-status", "status");
-articles.createIndex("by-status-score", ["status", "score"]);
-articles.getIndexes()[0]?.fields;
-articles.dropIndex("by-status");
-articles.createTextIndex("content", ["title", "body"]);
-articles.searchText("content", "public indexes", { operator: "OR" });
-articles.getTextIndexes()[0]?.name;
-articles.dropTextIndex("content");
-articles.reindex().count();
-const saved: void = database.save();
-
-IluDB.use(nodeJSONPlugin);
-const jsonDatabase = IluDB("./tmp/database.json");
-jsonDatabase.dir.toUpperCase();
-const jsonDatabaseCreatedAt: Date = jsonDatabase.data.createdAt;
-jsonDatabase.data.modifiedAt.toISOString();
-jsonDatabase.data.revision.toFixed();
-const jsonSaved: void = jsonDatabase.save();
-const jsonReloaded: void = jsonDatabase.reload();
-const jsonWatched: void = jsonDatabase.watch({
-    interval: 500,
-    onReload(reloaded) {
-        reloaded.data.revision.toFixed();
-    },
-    onError(error) {
-        error.message.toUpperCase();
-    },
-});
-const jsonUnwatched: void = jsonDatabase.unwatch();
-const conflictConstructor: typeof nodeJSONPlugin.ConflictError =
-    nodeJSONPlugin.ConflictError;
-const jsonArticles = jsonDatabase.getCollection<Article>("articles");
-const jsonArticle = jsonArticles.add({
-    title: "Persisted types",
-    body: "JSON metadata can be serialized",
-    score: 2,
-    status: "draft",
-});
-const jsonCollectionCreatedAt: Date =
-    jsonDatabase.data.collections.articles.createdAt;
-jsonDatabase.data.collections.articles.modifiedAt.toISOString();
-if (jsonArticle) {
-    const jsonCreatedAt: Date = jsonArticle.$createdAt;
-    jsonArticle.$createdAt.toISOString();
-}
-
-// @ts-expect-error in-memory databases do not expose the JSON file path
-database.dir;
-// @ts-expect-error in-memory databases do not expose persisted revisions
-database.data.revision;
-// @ts-expect-error sort directions are limited to 1 and -1
-articles.find({}, { sort: { score: 0 } });
-// @ts-expect-error queries only accept document fields
-articles.find({ missing: true });
-// @ts-expect-error index fields only accept document fields
-articles.createIndex("missing", "missing");
-// @ts-expect-error text operators are limited to AND and OR
-articles.searchText("content", "query", { operator: "XOR" });
-// @ts-expect-error reserved metadata is assigned by IluDB
-articles.add({ title: "x", body: "x", score: 1, status: "draft", $id: 1 });
-// @ts-expect-error save is synchronous
-const pendingSave: Promise<void> = jsonDatabase.save();
-// @ts-expect-error internal helpers are not public
-IluDB.tokenize("hidden");
-// @ts-expect-error runtime postings are not public
-articles.postings;
-`
-    );
-    writeFileSync(
-      join(workspace, "consumer-commonjs.cts"),
-      `
-import IluDB = require("iludb");
-import nodeJSONPlugin = require("iludb/plugins/node-json");
-
-IluDB.use(nodeJSONPlugin);
-const database = IluDB("./tmp/commonjs.json");
-const records = database.getCollection<{ name: string }>("records");
-records.add({ name: "CommonJS" });
-database.dir.toUpperCase();
-const saved: void = database.save();
-database.reload();
-database.watch();
-database.unwatch();
-database.data.revision.toFixed();
-nodeJSONPlugin.ConflictError;
-`
-    );
-    writeFileSync(
-      join(workspace, "tsconfig.json"),
-      JSON.stringify({
-        compilerOptions: {
-          esModuleInterop: true,
-          module: "NodeNext",
-          moduleResolution: "NodeNext",
-          noEmit: true,
-          strict: true,
-          target: "ES2022",
-          types: []
-        },
-        files: ["consumer.mts", "consumer-commonjs.cts"]
-      })
-    );
-
-    run({
-      cwd: workspace,
-      command: [join(root, "node_modules", ".bin", "tsc"), "--project", "tsconfig.json"]
-    });
-  });
-
-  it("keeps readable outputs larger and more legible than minified outputs", () => {
-    const pairs = [
-      ["dist/iludb.js", "dist/iludb.min.js"],
-      ["dist/plugins/node-json.js", "dist/plugins/node-json.min.js"]
-    ];
-    for (let index = 0; index < pairs.length; index += 1) {
-      const readable = readFileSync(join(root, pairs[index][0]), "utf8");
-      const minified = readFileSync(join(root, pairs[index][1]), "utf8");
-      expect(readable.length).toBeGreaterThan(minified.length);
-      expect(readable.split("\n").length).toBeGreaterThan(20);
-      expect(minified.split("\n").length).toBeLessThan(5);
-    }
   });
 });

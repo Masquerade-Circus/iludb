@@ -4,9 +4,12 @@
         return;
     }
     if (typeof define === "function" && define.amd) {
-        define(["fs"], function (dependency0) {
+        define(["node:fs", "node:fs/promises", "node:path", "node:crypto"], function (dependency0, dependency1, dependency2, dependency3) {
             return factory(function (id) {
-            if (id === "fs") { return dependency0; }
+            if (id === "node:fs") { return dependency0; }
+            if (id === "node:fs/promises") { return dependency1; }
+            if (id === "node:path") { return dependency2; }
+            if (id === "node:crypto") { return dependency3; }
                 throw new Error("Unsupported external module: " + id);
             });
         });
@@ -65,426 +68,297 @@ __export(exports_node_json, {
   default: () => node_json_default
 });
 module.exports = __toCommonJS(exports_node_json);
-var import_fs = require("fs");
-var temporaryCounter = 0;
 
-class ConflictError extends Error {
+// src/plugins/file-storage.ts
+var import_node_fs = require("node:fs");
+var import_promises = require("node:fs/promises");
+var import_node_path = require("node:path");
+var import_node_crypto = require("node:crypto");
+
+// src/persistence.ts
+class PersistenceError extends Error {
+  code;
+  constructor(code, message, options) {
+    super(message, options);
+    this.code = code;
+    this.name = "PersistenceError";
+  }
+}
+
+class ConflictError extends PersistenceError {
   expectedRevision;
   actualRevision;
   constructor(expectedRevision, actualRevision) {
-    super(`The persisted snapshot revision changed from ${expectedRevision} to ${String(actualRevision)}.`);
-    this.name = "ConflictError";
+    super("CONFLICT", "The persisted snapshot revision changed.");
     this.expectedRevision = expectedRevision;
     this.actualRevision = actualRevision;
   }
 }
-function isPlainObject(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+function plain(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 }
-function assertPlainObject(value, path) {
-  if (!isPlainObject(value)) {
-    throw new TypeError(`Invalid IluDB object at ${path}.`);
-  }
-}
-function restoreTimestamp({ owner, key, path }) {
-  if (!Object.hasOwn(owner, key)) {
-    throw new TypeError(`Missing IluDB timestamp at ${path}: expected a canonical ISO timestamp string.`);
-  }
-  const value = owner[key];
-  if (typeof value !== "string") {
-    throw new TypeError(`Invalid IluDB timestamp at ${path}: expected a canonical ISO timestamp string.`);
-  }
-  const timestamp = new Date(value);
-  if (Number.isNaN(timestamp.getTime()) || timestamp.toISOString() !== value) {
-    throw new TypeError(`Invalid IluDB timestamp at ${path}: expected a canonical ISO timestamp string.`);
-  }
-  owner[key] = timestamp;
-}
-function validateAndRestore(data) {
-  assertPlainObject(data, "database");
-  const revision = Object.hasOwn(data, "revision") ? data.revision : 0;
-  if (!Number.isSafeInteger(revision) || revision < 0) {
-    throw new TypeError("Invalid IluDB revision at database.revision: expected a non-negative safe integer.");
-  }
-  data.revision = revision;
-  restoreTimestamp({ owner: data, key: "createdAt", path: "database.createdAt" });
-  restoreTimestamp({
-    owner: data,
-    key: "modifiedAt",
-    path: "database.modifiedAt"
-  });
-  assertPlainObject(data.collections, "database.collections");
-  const names = Object.keys(data.collections);
-  for (let nameIndex = 0;nameIndex < names.length; nameIndex += 1) {
-    const name = names[nameIndex];
-    const collection = data.collections[name];
-    const collectionPath = `database.collections[${JSON.stringify(name)}]`;
-    assertPlainObject(collection, collectionPath);
-    if (!Array.isArray(collection.data)) {
-      throw new TypeError(`Invalid IluDB array at ${collectionPath}.data.`);
+function restore(serialized) {
+  try {
+    const data = JSON.parse(serialized);
+    if (!plain(data) || !plain(data.collections)) {
+      throw new Error("Invalid database");
     }
-    if (!Number.isSafeInteger(collection.index) || collection.index < 0) {
-      throw new TypeError(`Invalid IluDB index at ${collectionPath}.index: expected a non-negative safe integer.`);
+    if (!Object.hasOwn(data, "revision")) {
+      data.revision = 0;
     }
-    restoreTimestamp({
-      owner: collection,
-      key: "createdAt",
-      path: `${collectionPath}.createdAt`
-    });
-    restoreTimestamp({
-      owner: collection,
-      key: "modifiedAt",
-      path: `${collectionPath}.modifiedAt`
-    });
-    const documentIds = new Set;
-    let maximumDocumentId = 0;
-    for (let documentIndex = 0;documentIndex < collection.data.length; documentIndex += 1) {
-      const document = collection.data[documentIndex];
-      const documentPath = `${collectionPath}.data[${documentIndex}]`;
-      assertPlainObject(document, documentPath);
-      if (!Number.isSafeInteger(document.$id) || document.$id <= 0) {
-        throw new TypeError(`Invalid IluDB document id at ${documentPath}.$id: expected a positive safe integer.`);
+    if (!Number.isSafeInteger(data.revision) || data.revision < 0) {
+      throw new Error("Invalid revision");
+    }
+    const timestamp = (owner, key) => {
+      const value = owner[key];
+      if (typeof value !== "string") {
+        throw new Error("Invalid timestamp");
       }
-      if (documentIds.has(document.$id)) {
-        throw new TypeError(`Duplicate IluDB document id at ${documentPath}.$id.`);
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime()) || date.toISOString() !== value) {
+        throw new Error("Invalid timestamp");
       }
-      documentIds.add(document.$id);
-      if (document.$id > maximumDocumentId) {
-        maximumDocumentId = document.$id;
+      owner[key] = date;
+    };
+    timestamp(data, "createdAt");
+    timestamp(data, "modifiedAt");
+    for (const [name, collection] of Object.entries(data.collections)) {
+      assertCollectionName(name);
+      if (!plain(collection) || !Array.isArray(collection.data) || !Number.isSafeInteger(collection.index) || collection.index < 0) {
+        throw new Error("Invalid collection");
       }
-      restoreTimestamp({
-        owner: document,
-        key: "$createdAt",
-        path: `${documentPath}.$createdAt`
-      });
-      restoreTimestamp({
-        owner: document,
-        key: "$modifiedAt",
-        path: `${documentPath}.$modifiedAt`
-      });
+      timestamp(collection, "createdAt");
+      timestamp(collection, "modifiedAt");
+      const ids = new Set;
+      for (const document of collection.data) {
+        if (!plain(document) || !Number.isSafeInteger(document.$id) || document.$id <= 0 || document.$id > collection.index || ids.has(document.$id)) {
+          throw new Error("Invalid document");
+        }
+        ids.add(document.$id);
+        timestamp(document, "$createdAt");
+        timestamp(document, "$modifiedAt");
+      }
     }
-    if (collection.index < maximumDocumentId) {
-      throw new TypeError(`Invalid IluDB index at ${collectionPath}.index: expected a value greater than or equal to the maximum document id.`);
-    }
+    return data;
+  } catch (cause) {
+    throw new PersistenceError("INVALID_SNAPSHOT", "Invalid IluDB snapshot.", { cause });
   }
-  return data;
 }
-function readStableSnapshot(file) {
-  for (let attempt = 0;attempt < 3; attempt += 1) {
-    const pathStats = import_fs.lstatSync(file);
-    if (pathStats.isSymbolicLink() || !pathStats.isFile()) {
-      throw new TypeError(`IluDB path must be a regular file: ${file}`);
-    }
-    const descriptor = import_fs.openSync(file, "r");
-    try {
-      const before = import_fs.fstatSync(descriptor);
-      if (!before.isFile()) {
-        throw new TypeError(`IluDB path must be a regular file: ${file}`);
-      }
-      const serialized = import_fs.readFileSync(descriptor, "utf8");
-      const after = import_fs.fstatSync(descriptor);
-      if (signature(before) !== signature(after)) {
-        continue;
-      }
-      return {
-        data: validateAndRestore(JSON.parse(serialized)),
-        signature: signature(after)
-      };
-    } finally {
-      import_fs.closeSync(descriptor);
-    }
+function checkRevision(input) {
+  const actual = typeof input.serialized === "string" ? restore(input.serialized).revision : null;
+  if (actual !== input.expectedRevision) {
+    throw new ConflictError(input.expectedRevision ?? 0, actual);
   }
-  throw new Error(`IluDB file changed repeatedly while it was read: ${file}`);
 }
-function directoryOf(file) {
-  const separator = Math.max(file.lastIndexOf("/"), file.lastIndexOf("\\"));
-  if (separator < 0) {
-    return ".";
+function assertCollectionName(name) {
+  if (typeof name !== "string" || name.trim().length === 0 || name.trim() !== name || ["__proto__", "constructor", "prototype"].includes(name)) {
+    throw new PersistenceError("INVALID_INPUT", "Invalid collection name.");
   }
-  const directory = file.slice(0, separator);
-  if (directory.length === 0) {
-    return file[0];
-  }
-  return /^[A-Za-z]:$/.test(directory) ? directory + file[separator] : directory;
 }
+
+// src/plugins/file-storage.ts
 function signature(stats) {
   return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
 }
-function atomicWrite({
-  file,
-  serialized,
-  mode
-}) {
-  temporaryCounter += 1;
-  const temporary = `${file}.tmp-${process.pid}-${temporaryCounter}`;
-  let descriptor = null;
-  let temporaryCreated = false;
-  let renamed = false;
-  try {
-    descriptor = import_fs.openSync(temporary, "wx", 384);
-    temporaryCreated = true;
-    const bytes = Buffer.from(serialized);
-    let offset = 0;
-    while (offset < bytes.length) {
-      const written = import_fs.writeSync(descriptor, bytes, offset, bytes.length - offset, null);
-      if (!Number.isSafeInteger(written) || written <= 0) {
-        throw new Error("IluDB temporary write made no progress.");
-      }
-      offset += written;
-    }
-    if (mode !== null) {
-      import_fs.fchmodSync(descriptor, mode);
-    }
-    import_fs.fsyncSync(descriptor);
-    import_fs.closeSync(descriptor);
-    descriptor = null;
-    import_fs.renameSync(temporary, file);
-    renamed = true;
-    try {
-      return signature(import_fs.lstatSync(file));
-    } catch {
-      return null;
-    }
-  } catch (error) {
-    let primary = error;
-    if (descriptor !== null) {
-      try {
-        import_fs.closeSync(descriptor);
-      } catch (closeError) {
-        primary = new AggregateError([primary, closeError]);
-      }
-    }
-    if (!renamed && temporaryCreated) {
-      try {
-        import_fs.unlinkSync(temporary);
-      } catch (cleanupError) {
-        if (cleanupError?.code !== "ENOENT") {
-          throw new AggregateError([primary, cleanupError], "", {
-            cause: cleanupError
-          });
-        }
-      }
-    }
-    throw primary;
-  }
+function io(cause) {
+  throw cause instanceof PersistenceError ? cause : new PersistenceError("IO", "Snapshot filesystem operation failed.", { cause });
 }
-function toError(error) {
-  return error instanceof Error ? error : new Error(String(error));
-}
-function nodeJSONPlugin(IluDB) {
-  IluDB.getDatabase = function(file) {
-    if (typeof file !== "string" || file.length === 0) {
-      throw new TypeError("IluDB file path must be a non-empty string.");
-    }
-    const now = new Date;
-    const database = {
-      dir: file,
-      data: {
-        collections: {},
-        createdAt: now,
-        modifiedAt: now,
-        revision: 0
-      }
-    };
-    let loadedRevision = 0;
-    let loadedPath = file;
-    let ownPublication = null;
-    let watchState = "stopped";
-    let watchPath = null;
-    let watchListener = null;
-    let watchOptions = {};
-    let baselineSignature = null;
-    let failedSignature = null;
-    let pendingSignature = null;
-    database.getCollection = function(name) {
-      return IluDB.getCollection(database, name);
-    };
-    database.reload = function() {
-      const path = database.dir;
-      for (let attempt = 0;attempt < 3; attempt += 1) {
-        const snapshot = readStableSnapshot(path);
-        const staged = IluDB._stageData(database, snapshot.data);
-        const pathStats = import_fs.lstatSync(path);
-        if (pathStats.isSymbolicLink() || !pathStats.isFile()) {
-          throw new TypeError(`IluDB path must be a regular file: ${path}`);
-        }
-        if (signature(pathStats) !== snapshot.signature) {
-          continue;
-        }
-        IluDB._publishData(database, staged);
-        loadedRevision = snapshot.data.revision;
-        loadedPath = path;
-        baselineSignature = snapshot.signature;
-        ownPublication = null;
-        return;
-      }
-      throw new Error(`IluDB file changed repeatedly while reload was staged: ${path}`);
-    };
-    database.save = function() {
-      const path = database.dir;
-      let mode = null;
-      try {
-        const stats = import_fs.lstatSync(path);
-        if (stats.isSymbolicLink() || !stats.isFile()) {
-          throw new TypeError(`IluDB path must be a regular file: ${path}`);
-        }
-        mode = stats.mode & 4095;
-        const disk = validateAndRestore(JSON.parse(import_fs.readFileSync(path, "utf8")));
-        if (disk.revision !== loadedRevision) {
-          throw new ConflictError(loadedRevision, disk.revision);
-        }
-      } catch (error) {
-        if (error?.code !== "ENOENT") {
-          throw error;
-        }
-        if (path === loadedPath) {
-          throw new ConflictError(loadedRevision, null);
-        }
-        import_fs.mkdirSync(directoryOf(path), { recursive: true });
-      }
-      const modifiedAt = new Date;
-      const revision = loadedRevision + 1;
-      const snapshot = {
-        ...database.data,
-        modifiedAt,
-        revision
-      };
-      const serialized = JSON.stringify(snapshot);
-      if (typeof serialized !== "string") {
-        throw new TypeError("IluDB data could not be serialized.");
-      }
-      validateAndRestore(JSON.parse(serialized));
-      const publishedSignature = atomicWrite({
-        file: path,
-        serialized,
-        mode
-      });
-      database.data.modifiedAt = modifiedAt;
-      database.data.revision = revision;
-      loadedRevision = revision;
-      loadedPath = path;
-      baselineSignature = publishedSignature;
-      ownPublication = publishedSignature === null ? null : { revision, signature: publishedSignature };
-    };
-    database.unwatch = function() {
-      if (watchListener !== null && watchPath !== null) {
-        import_fs.unwatchFile(watchPath, watchListener);
-      }
-      watchState = "stopped";
-      watchPath = null;
-      watchListener = null;
-      pendingSignature = null;
-    };
-    database.watch = function(options = {}) {
-      if (watchState !== "stopped") {
-        return;
-      }
-      if (!isPlainObject(options)) {
-        throw new TypeError("Watch options must be an object.");
-      }
-      const interval = options.interval ?? 500;
-      if (!Number.isSafeInteger(interval) || interval <= 0) {
-        throw new TypeError("Watch interval must be a positive integer.");
-      }
-      if (typeof options.onReload !== "undefined" && typeof options.onReload !== "function") {
-        throw new TypeError("onReload must be a function.");
-      }
-      if (typeof options.onError !== "undefined" && typeof options.onError !== "function") {
-        throw new TypeError("onError must be a function.");
-      }
-      watchOptions = options;
-      watchPath = database.dir;
-      baselineSignature = signature(import_fs.lstatSync(watchPath));
-      watchState = "idle";
-      const reportError = (error) => {
-        if (typeof watchOptions.onError === "function") {
-          try {
-            watchOptions.onError(toError(error));
-          } catch {}
-        }
-      };
-      const processChange = (nextSignature) => {
-        if (watchState === "stopped") {
-          return;
-        }
-        if (watchState === "processing" || watchState === "pending") {
-          watchState = "pending";
-          pendingSignature = nextSignature;
-          return;
-        }
-        if (nextSignature === baselineSignature && ownPublication === null || nextSignature === failedSignature) {
-          return;
-        }
-        watchState = "processing";
-        let reloaded = false;
-        let processingError = null;
+function fileAdapter(native = null) {
+  return {
+    asynchronous: true,
+    open(destination) {
+      const file = import_node_path.resolve(destination);
+      function read() {
+        let descriptor;
         try {
-          if (ownPublication !== null && ownPublication.signature === nextSignature) {
-            const snapshot = readStableSnapshot(watchPath);
-            if (snapshot.signature === nextSignature && snapshot.data.revision === ownPublication.revision) {
-              baselineSignature = snapshot.signature;
-              ownPublication = null;
-            } else {
-              database.reload();
-              reloaded = true;
-            }
-          } else {
-            database.reload();
-            reloaded = true;
+          descriptor = import_node_fs.openSync(file, import_node_fs.constants.O_RDONLY | import_node_fs.constants.O_NOFOLLOW);
+        } catch (cause) {
+          if (cause.code === "ENOENT") {
+            return null;
           }
-          failedSignature = null;
-        } catch (error) {
-          failedSignature = nextSignature;
-          processingError = error;
+          return io(cause);
         }
-        const queued = pendingSignature;
-        pendingSignature = null;
-        watchState = "idle";
-        if (processingError !== null) {
-          reportError(processingError);
-        }
-        if (reloaded && typeof watchOptions.onReload === "function") {
-          try {
-            watchOptions.onReload(database);
-          } catch (error) {
-            reportError(error);
+        try {
+          const before = import_node_fs.fstatSync(descriptor);
+          if (!before.isFile()) {
+            throw new Error("Expected regular file");
           }
+          const serialized = import_node_fs.readFileSync(descriptor, "utf8");
+          const after = import_node_fs.fstatSync(descriptor);
+          const current = import_node_fs.lstatSync(file);
+          if (!current.isFile() || signature(before) !== signature(after) || signature(after) !== signature(current)) {
+            throw new Error("Snapshot changed during reading");
+          }
+          return serialized;
+        } catch (cause) {
+          return io(cause);
+        } finally {
+          import_node_fs.closeSync(descriptor);
         }
-        if (watchListener !== null && queued !== null) {
-          processChange(queued);
-        }
-      };
-      watchListener = (current) => {
-        processChange(signature(current));
-      };
-      import_fs.watchFile(watchPath, { interval, persistent: false }, watchListener);
-    };
-    try {
-      database.reload();
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        throw error;
       }
-      import_fs.mkdirSync(directoryOf(file), { recursive: true });
-      const serialized = JSON.stringify(database.data);
-      baselineSignature = atomicWrite({
-        file,
-        serialized,
-        mode: null
-      });
-      const staged = IluDB._stageData(database, database.data);
-      IluDB._publishData(database, staged);
+      async function asyncRead() {
+        let descriptor;
+        try {
+          descriptor = await import_promises.open(file, import_node_fs.constants.O_RDONLY | import_node_fs.constants.O_NOFOLLOW);
+        } catch (cause) {
+          if (cause.code === "ENOENT") {
+            return null;
+          }
+          return io(cause);
+        }
+        try {
+          const before = await descriptor.stat();
+          if (!before.isFile()) {
+            throw new Error("Expected regular file");
+          }
+          const serialized = native === null ? await descriptor.readFile("utf8") : await native.file(descriptor.fd).text();
+          const after = await descriptor.stat();
+          const current = await import_promises.lstat(file);
+          if (!current.isFile() || signature(before) !== signature(after) || signature(after) !== signature(current)) {
+            throw new Error("Snapshot changed during reading");
+          }
+          return serialized;
+        } catch (cause) {
+          return io(cause);
+        } finally {
+          await descriptor.close();
+        }
+      }
+      return {
+        read,
+        asyncRead,
+        write(input) {
+          const temporary = `${file}.tmp-${import_node_crypto.randomUUID()}`;
+          let descriptor = null;
+          let created = false;
+          let published = false;
+          let failure = null;
+          try {
+            checkRevision({ serialized: read(), expectedRevision: input.expectedRevision });
+            const mode = input.expectedRevision === null ? 384 : import_node_fs.lstatSync(file).mode & 4095;
+            if (input.expectedRevision === null) {
+              import_node_fs.mkdirSync(import_node_path.dirname(file), { recursive: true, mode: 448 });
+            }
+            descriptor = import_node_fs.openSync(temporary, "wx", 384);
+            created = true;
+            const bytes = Buffer.from(input.serialized);
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = import_node_fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
+              if (count <= 0) {
+                throw new Error("Incomplete write");
+              }
+              offset += count;
+            }
+            import_node_fs.fchmodSync(descriptor, mode);
+            import_node_fs.fsyncSync(descriptor);
+            import_node_fs.closeSync(descriptor);
+            descriptor = null;
+            if (input.expectedRevision === null) {
+              import_node_fs.linkSync(temporary, file);
+            } else {
+              import_node_fs.renameSync(temporary, file);
+            }
+            published = true;
+          } catch (cause) {
+            failure = cause;
+          } finally {
+            if (descriptor !== null) {
+              try {
+                import_node_fs.closeSync(descriptor);
+              } catch (cause) {
+                failure = failure === null ? cause : new AggregateError([failure, cause]);
+              }
+            }
+            if (created && (!published || input.expectedRevision === null)) {
+              try {
+                import_node_fs.unlinkSync(temporary);
+              } catch (cause) {
+                if (!published) {
+                  failure = failure === null ? cause : new AggregateError([failure, cause]);
+                } else {
+                  process.emitWarning("Committed snapshot temporary cleanup failed.");
+                }
+              }
+            }
+          }
+          if (failure !== null) {
+            io(failure);
+          }
+        },
+        async asyncWrite(input) {
+          const temporary = `${file}.tmp-${import_node_crypto.randomUUID()}`;
+          let descriptor = null;
+          let created = false;
+          let published = false;
+          let failure = null;
+          try {
+            checkRevision({ serialized: await asyncRead(), expectedRevision: input.expectedRevision });
+            const mode = input.expectedRevision === null ? 384 : (await import_promises.lstat(file)).mode & 4095;
+            if (input.expectedRevision === null) {
+              await import_promises.mkdir(import_node_path.dirname(file), { recursive: true, mode: 448 });
+            }
+            descriptor = await import_promises.open(temporary, "wx", 384);
+            created = true;
+            const bytes = Buffer.from(input.serialized);
+            if (native === null) {
+              await descriptor.writeFile(bytes);
+            } else if (await native.write(native.file(descriptor.fd), bytes) !== bytes.length) {
+              throw new Error("Incomplete write");
+            }
+            await descriptor.chmod(mode);
+            await descriptor.sync();
+            await descriptor.close();
+            descriptor = null;
+            if (input.expectedRevision === null) {
+              await import_promises.link(temporary, file);
+            } else {
+              await import_promises.rename(temporary, file);
+            }
+            published = true;
+          } catch (cause) {
+            failure = cause;
+          } finally {
+            if (descriptor !== null) {
+              try {
+                await descriptor.close();
+              } catch (cause) {
+                failure = failure === null ? cause : new AggregateError([failure, cause]);
+              }
+            }
+            if (created && (!published || input.expectedRevision === null)) {
+              try {
+                if (native === null) {
+                  await import_promises.unlink(temporary);
+                } else {
+                  await native.file(temporary).delete();
+                }
+              } catch (cause) {
+                if (!published) {
+                  failure = failure === null ? cause : new AggregateError([failure, cause]);
+                } else {
+                  process.emitWarning("Committed snapshot temporary cleanup failed.");
+                }
+              }
+            }
+          }
+          if (failure !== null) {
+            io(failure);
+          }
+        },
+        subscribe(onChange, options) {
+          const listener = () => onChange();
+          import_node_fs.watchFile(file, { interval: options.interval, persistent: false }, listener);
+          return () => import_node_fs.unwatchFile(file, listener);
+        }
+      };
     }
-    IluDB.plugify(database);
-    return database;
   };
 }
-nodeJSONPlugin.ConflictError = ConflictError;
-var node_json_default = nodeJSONPlugin;
+
+// src/plugins/node-json.ts
+var nodeJSON = Object.assign(fileAdapter(), { ConflictError, PersistenceError });
+var node_json_default = nodeJSON;
 
     const value = module.exports;
     return value && value.__esModule && "default" in value

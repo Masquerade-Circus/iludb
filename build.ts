@@ -95,10 +95,52 @@ await buildDistribution({
   filename: "plugins/node-json",
   globalName: "IluDBNodeJSONPlugin",
   target: "node",
-  external: ["fs"]
+  external: ["node:fs", "node:fs/promises", "node:path", "node:crypto"]
 });
 
 await Bun.write("./dist/iludb.d.ts", Bun.file("./types/iludb.d.ts"));
+await buildDistribution({
+  entrypoint: "./src/plugins/bun-json.ts",
+  filename: "plugins/bun-json",
+  globalName: "IluDBBunJSONPlugin",
+  target: "node",
+  external: ["node:fs", "node:fs/promises", "node:path", "node:crypto"]
+});
+await Bun.write("./dist/plugins/bun-json.d.ts", Bun.file("./types/plugins/bun-json.d.ts"));
 await Bun.write("./dist/plugins/node-json.d.ts", Bun.file("./types/plugins/node-json.d.ts"));
+await buildDistribution({
+  entrypoint: "./src/plugins/local-storage.ts",
+  filename: "plugins/local-storage",
+  globalName: "IluDBLocalStorageAdapter",
+  target: "browser"
+});
+await Bun.write("./dist/plugins/local-storage.d.ts", Bun.file("./types/plugins/local-storage.d.ts"));
+
+// Optional portable distribution for consumers that vendor the published package.
+if (process.argv[2] === "--vendor-dir" && typeof process.argv[3] === "string") {
+  const destination = process.argv[3];
+  const manifest = await Bun.file("./package.json").json();
+  delete manifest.scripts;
+  delete manifest.devDependencies;
+  await Bun.write(`${destination}/package.json`, `${JSON.stringify(manifest, null, 2)}\n`);
+  for (const file of [
+    "LICENSE",
+    "README.md",
+    "dist/iludb.js",
+    "dist/iludb.min.js",
+    "dist/iludb.d.ts",
+    "dist/plugins/node-json.js",
+    "dist/plugins/node-json.min.js",
+    "dist/plugins/node-json.d.ts",
+    "dist/plugins/bun-json.js",
+    "dist/plugins/bun-json.min.js",
+    "dist/plugins/bun-json.d.ts",
+    "dist/plugins/local-storage.js",
+    "dist/plugins/local-storage.min.js",
+    "dist/plugins/local-storage.d.ts"
+  ]) {
+    await Bun.write(`${destination}/${file}`, Bun.file(`./${file}`));
+  }
+}
 
 export {};
