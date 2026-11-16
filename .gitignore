@@ -54,3 +54,5 @@ typings/
 
 # Temporary files
 tmp/
+.playwright-mcp
+.tmp

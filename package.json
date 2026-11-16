@@ -1,6 +1,6 @@
 {
   "name": "iludb",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "IluDb is a minimal in-memory database for Node.js and the web.",
   "repository": "git@github.com:Masquerade-Circus/iludb.git",
   "author": "Masquerade <christian@masquerade-circus.net>",
@@ -37,6 +37,7 @@
     }
   },
   "scripts": {
+    "release": "release-it",
     "build": "bun run build.ts",
     "typecheck": "bunx tsc --noEmit",
     "lint": "eslint .",
@@ -47,6 +48,14 @@
     "test:browser": "bun run build && playwright test",
     "bench": "bun run build && bun run bench/index.ts"
   },
+  "release-it": {
+    "hooks": {
+      "after:bump": "npm run build"
+    },
+    "git": {
+      "requireCleanWorkingDir": false
+    }
+  },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.65.0",
@@ -54,6 +63,7 @@
     "eslint": "^10.8.1",
     "globals": "^17.9.0",
     "prettier": "^3.9.6",
+    "release-it": "^21.1.2",
     "typescript": "^5.9.2",
     "typescript-eslint": "^8.66.0"
   }
